@@ -504,23 +504,50 @@ def main():
     save_icon_file()
     ensure_active()
 
+    bgmode_file = DATA / "bgmode.json"
+
+    def get_bgmode():
+        try:
+            m = json.loads(bgmode_file.read_text(encoding="utf-8"))
+            return m.get("mode", "image"), int(m.get("blur", 0))
+        except (OSError, ValueError, TypeError):
+            return "image", 0
+
+    def set_bgmode(mode, blur=0):
+        def _(icon, _item):
+            write_json_atomic(bgmode_file, {"mode": mode, "blur": blur})
+            icon.update_menu()
+        return _
+
     def choose(path):
         def _(icon, _item):
             set_active(path)
+            write_json_atomic(bgmode_file, {"mode": "image", "blur": 0})  # выбрали картинку — режим замены фона
             icon.update_menu()
         return _
 
     def items():
         cur = read_state().get("active", "")
+        mode, blur = get_bgmode()
         root, folders = tree()
 
         def entry(p):
-            return pystray.MenuItem(p.stem, choose(p), radio=True, checked=lambda _i, r=rel(p): cur == r)
+            return pystray.MenuItem(p.stem, choose(p), radio=True,
+                                    checked=lambda _i, r=rel(p): mode == "image" and cur == r)
+
+        yield pystray.MenuItem(t("Без фона — только камера", "No background — camera only"), set_bgmode("none"),
+                               radio=True, checked=lambda _i: mode == "none")
+        yield pystray.MenuItem(t("Размытие", "Blur"), pystray.Menu(*[
+            pystray.MenuItem(label, set_bgmode("blur", level), radio=True,
+                             checked=lambda _i, level=level: mode == "blur" and blur == level)
+            for level, label in ((4, t("Лёгкое", "Light")), (8, t("Среднее", "Medium")), (14, t("Сильное", "Strong")))]),
+            checked=lambda _i: mode == "blur")
+        yield pystray.Menu.SEPARATOR
 
         for name, imgs in folders:
             # Галочка на папке подсказывает, где лежит текущий фон
             yield pystray.MenuItem(name, pystray.Menu(*[entry(p) for p in imgs]),
-                                   checked=lambda _i, n=name: cur.startswith(n + "/"))
+                                   checked=lambda _i, n=name: mode == "image" and cur.startswith(n + "/"))
         if folders and root:
             yield pystray.Menu.SEPARATOR
         for p in root:
@@ -655,6 +682,15 @@ def main():
                 diag_open.clear()
         threading.Thread(target=work, daemon=True).start()
 
+    def open_camera_settings(icon, _item):
+        # Окно свойств камеры откроет Lua в OBS: включит камеру и нажмёт «Настроить видео»
+        f = DATA / "camera_settings.json"
+        try:
+            seq = json.loads(f.read_text(encoding="utf-8")).get("seq", 0) + 1
+        except (OSError, ValueError):
+            seq = 1
+        write_json_atomic(f, {"seq": seq})
+
     def toggle_autostart(icon, _item):
         set_autostart(not STARTUP_LNK.exists())
         icon.update_menu()
@@ -684,6 +720,7 @@ def main():
                 if q != "custom" or "custom" in read_quality_file()],
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem(t("Настроить маску…", "Tune the mask…"), open_tuner))),
+            pystray.MenuItem(t("Камера: яркость, зум, фокус…", "Camera: brightness, zoom, focus…"), open_camera_settings),
             pystray.MenuItem(t("Разрешение", "Resolution"), pystray.Menu(*[
                 pystray.MenuItem(label, set_resolution(hgt), radio=True,
                                  checked=lambda _i, hgt=hgt: get_resolution() == hgt)

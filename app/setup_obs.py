@@ -107,6 +107,8 @@ local PREVIEW_FILE = DIR .. "\\preview.json"
 local MIRROR_FILE = DIR .. "\\mirror.json"
 local RESOLUTION_FILE = DIR .. "\\resolution.json"
 local STATUS_FILE = DIR .. "\\status.json"
+local BGMODE_FILE = DIR .. "\\bgmode.json"
+local CAMCFG_FILE = DIR .. "\\camera_settings.json"
 local RESOLUTIONS = {[720] = {1280, 720}, [1080] = {1920, 1080}}
 local PROFILES = {profiles}
 local applied = nil
@@ -434,6 +436,75 @@ local function ensure_tray()
 	end
 end
 
+-- Режим фона из bgmode.json: {"mode": "image" | "none" | "blur", "blur": 1..20}.
+-- «none» — фильтр вырезания выключен, в кадре просто камера (Shirma как утилита
+-- для камеры, процессор не тратится на маску); «blur» — плагин размывает
+-- собственный фон камеры вместо того, чтобы делать его прозрачным.
+local bgmode_applied = nil
+-- Окно настроек камеры (яркость, зум, фокус… — что умеет драйвер) открывается
+-- только у включённой камеры, поэтому на время запроса держим её включённой
+-- (объявлено до check_camera_settings и camera_on_demand — обе её используют).
+local camcfg_until = 0
+
+local function apply_bgmode()
+	local mode, blur = "image", 0
+	local d = obs.obs_data_create_from_json_file(BGMODE_FILE)
+	if d ~= nil then
+		mode = obs.obs_data_get_string(d, "mode")
+		blur = obs.obs_data_get_int(d, "blur")
+		obs.obs_data_release(d)
+	end
+	if mode ~= "none" and mode ~= "blur" then mode = "image" end
+	if mode == "blur" then blur = math.min(math.max(blur, 1), 20) else blur = 0 end
+	local sig = mode .. ":" .. blur
+	if sig == bgmode_applied then return end
+	local src = obs.obs_get_source_by_name("Камера")
+	if src == nil then return end
+	local filter = obs.obs_source_get_filter_by_name(src, "Удаление фона")
+	if filter ~= nil then
+		obs.obs_source_set_enabled(filter, mode ~= "none")
+		local data = obs.obs_data_create()
+		obs.obs_data_set_int(data, "blur_background", blur)
+		obs.obs_source_update(filter, data)
+		obs.obs_data_release(data)
+		obs.obs_source_release(filter)
+		bgmode_applied = sig
+		print("background mode " .. sig)
+	end
+	obs.obs_source_release(src)
+end
+
+-- Окно настроек камеры: трей пишет новый номер запроса в camera_settings.json.
+-- Включаем камеру, ждём инициализации и жмём кнопку «Настроить видео» источника —
+-- откроется штатное окно свойств драйвера камеры.
+local camcfg_seq = nil
+local camcfg_pending = false
+
+local function check_camera_settings()
+	local d = obs.obs_data_create_from_json_file(CAMCFG_FILE)
+	if d ~= nil then
+		local seq = obs.obs_data_get_int(d, "seq")
+		obs.obs_data_release(d)
+		if camcfg_seq ~= nil and seq ~= camcfg_seq then
+			camcfg_pending = true
+			camcfg_until = os.time() + 15
+		end
+		camcfg_seq = seq
+	end
+	if camcfg_pending and camera_shown and os.time() - camera_shown_at >= 2 then
+		local src = obs.obs_get_source_by_name("Камера")
+		if src ~= nil then
+			local props = obs.obs_source_properties(src)
+			local button = obs.obs_properties_get(props, "video_config")
+			if button ~= nil then obs.obs_property_button_clicked(button, src) end
+			obs.obs_properties_destroy(props)
+			obs.obs_source_release(src)
+		end
+		camcfg_pending = false
+		-- дальше камеру держит открытое окно свойств (видимое окно нашего OBS)
+	end
+end
+
 -- Камера по требованию. Программа, которая берёт кадры виртуальной камеры, держит
 -- открытым дескриптор общей памяти OBSVirtualCamVideo — только пока идёт показ
 -- (модуль камеры, загруженный ради списка устройств, дескриптор не держит).
@@ -478,8 +549,9 @@ end
 
 local function camera_on_demand()
 	apply_quality()  -- раз в 0.5 с: ползунки тонкой настройки откликаются быстро
+	apply_bgmode()
 	local now = os.time()
-	if vcam_readers() > 0 or own_window_visible() then wanted_at = now end
+	if vcam_readers() > 0 or own_window_visible() or now < camcfg_until then wanted_at = now end
 	local show = now - wanted_at < KEEP_ON
 	if show ~= camera_shown and set_camera_shown(show) then
 		camera_shown = show
@@ -642,6 +714,7 @@ local function tick()
 	apply_camera()
 	check_preview()
 	resize_preview()
+	check_camera_settings()
 	hide_obs_tray_icon()  -- снова, если Проводник перезапустился и Qt вернул значок
 	ensure_tray()
 end
