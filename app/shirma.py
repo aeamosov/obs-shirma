@@ -191,6 +191,87 @@ def mask_tuner(quality_file, read_quality_file):
     root.mainloop()
 
 
+def diagnostics_text(status, samples):
+    """Сводка для окна «Диагностика» и для копирования (без путей и имён)."""
+    if not status or time.time() - status.get("updated", 0) > 10:
+        return t("OBS не отвечает: Shirma не запущена или ещё стартует.",
+                 "OBS is not responding: Shirma is not running or is still starting.")
+    w, h = status.get("camera_width", 0), status.get("camera_height", 0)
+    req = status.get("camera_requested", "")
+    if not status.get("camera_shown"):
+        cam = t("выключена — нет звонка и не открыто превью", "off — no call and no preview")
+    elif w == 0 and status.get("camera_shown_for", 0) < 5:
+        cam = t("включается…", "starting…")
+    elif w == 0:
+        cam = t("нет кадров", "no frames")
+    else:
+        cam = f"{w}×{h}"
+    if req and req != "native":
+        cam += t(f" (запрошено {req.replace('x', '×')})", f" (requested {req.replace('x', '×')})")
+    if status.get("camera_mode_failed"):
+        cam += t(" — разрешение кадра не поддерживается, родной режим камеры",
+                 " — frame size not supported, using the camera's native mode")
+    lag = "—"
+    if len(samples) >= 2:
+        (_, tot0, lag0), (_, tot1, lag1) = samples[0], samples[-1]
+        if tot1 > tot0:
+            lag = f"{100 * (lag1 - lag0) / (tot1 - tot0):.1f}%"
+    canvas = status.get("canvas", "?").replace("x", "×")
+    q = status.get("quality", "")
+    q = q.split(":")[0] if q.startswith("custom") else q
+    lines = [
+        t(f"Камера: {cam}", f"Camera: {cam}"),
+        t(f"Кадр (холст и виртуальная камера): {canvas}", f"Frame (canvas and virtual camera): {canvas}"),
+        t(f"Рендер OBS: {status.get('render_fps', 0):.1f} к/с, кадр {status.get('frame_time_ms', 0):.1f} мс",
+          f"OBS render: {status.get('render_fps', 0):.1f} fps, frame {status.get('frame_time_ms', 0):.1f} ms"),
+        t(f"Опоздавшие кадры за последние 10 с: {lag}", f"Lagged frames, last 10 s: {lag}"),
+        t(f"Качество маски: {q}", f"Mask quality: {q}"),
+    ]
+    return "\n".join(lines)
+
+
+def diagnostics_window(status_file):
+    import tkinter as tk
+    from collections import deque
+    samples = deque()  # (время, всего кадров, опоздавших) за последние 10 с
+    root = tk.Tk()
+    root.title(t("Shirma — диагностика", "Shirma — diagnostics"))
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+    body = tk.Label(root, justify="left", anchor="w", font=("Segoe UI", 10), width=64)
+    body.pack(padx=14, pady=(12, 4), anchor="w")
+    tk.Label(root, justify="left", fg="#666", wraplength=520, text=t(
+        "FPS рендера OBS — не частота обновления маски и не то, что программа звонка отправляет собеседнику.",
+        "OBS render FPS is not the mask update rate and not what the call app sends to the other side.")
+             ).pack(padx=14, anchor="w")
+    state = {"text": ""}
+
+    def refresh():
+        try:
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            status = {}
+        now = time.time()
+        if status:
+            samples.append((now, status.get("total_frames", 0), status.get("lagged_frames", 0)))
+        while samples and now - samples[0][0] > 10:
+            samples.popleft()
+        state["text"] = diagnostics_text(status, list(samples))
+        body.config(text=state["text"])
+        root.after(1000, refresh)
+
+    def copy():
+        root.clipboard_clear()
+        root.clipboard_append("Shirma\n" + state["text"])
+
+    row = tk.Frame(root)
+    row.pack(fill="x", padx=14, pady=12)
+    tk.Button(row, text=t("Скопировать сводку", "Copy summary"), command=copy).pack(side="left")
+    tk.Button(row, text=t("Закрыть", "Close"), command=root.destroy).pack(side="right")
+    refresh()
+    root.mainloop()
+
+
 def obs_running():
     out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq obs64.exe", "/NH"],
                          capture_output=True, creationflags=NO_WINDOW).stdout
@@ -492,6 +573,20 @@ def main():
             icon.update_menu()
         return _
 
+    diag_open = threading.Event()
+
+    def open_diagnostics(icon, _item):
+        if diag_open.is_set():
+            return
+        diag_open.set()
+
+        def work():
+            try:
+                diagnostics_window(DATA / "status.json")
+            finally:
+                diag_open.clear()
+        threading.Thread(target=work, daemon=True).start()
+
     def toggle_autostart(icon, _item):
         set_autostart(not STARTUP_LNK.exists())
         icon.update_menu()
@@ -530,6 +625,7 @@ def main():
                                  checked=lambda _i: get_mirror().get("background", False)),
                 pystray.MenuItem(t("Камеру", "Camera"), toggle_mirror("camera"),
                                  checked=lambda _i: get_mirror().get("camera", False)))))),
+        pystray.MenuItem(t("Диагностика…", "Diagnostics…"), open_diagnostics),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(t("Автозапуск", "Start with Windows"), toggle_autostart, checked=lambda _i: STARTUP_LNK.exists()),
         pystray.MenuItem(t("Выключить Shirma", "Quit Shirma"), shutdown),

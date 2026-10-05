@@ -106,15 +106,71 @@ local CAMERA_FILE = DIR .. "\\camera.json"
 local PREVIEW_FILE = DIR .. "\\preview.json"
 local MIRROR_FILE = DIR .. "\\mirror.json"
 local RESOLUTION_FILE = DIR .. "\\resolution.json"
+local STATUS_FILE = DIR .. "\\status.json"
 local RESOLUTIONS = {[720] = {1280, 720}, [1080] = {1920, 1080}}
 local PROFILES = {profiles}
 local applied = nil
 -- Плагин читает эти ключи как целые; остальные числа — как дробные (mask_expansion тоже)
 local INT_KEYS = {mask_every_x_frames = true, numThreads = true}
 
--- Тонкая настройка из трея: {"quality": "custom", "custom": {threshold, mask_expansion,
--- temporal_smooth_factor, feather, smooth_contour}} поверх «высокого»
-local CUSTOM_KEYS = {"threshold", "mask_expansion", "temporal_smooth_factor", "feather", "smooth_contour"}
+-- Свой профиль: {"quality": "custom", "custom": {...}} поверх «высокого». Схема:
+-- ключ -> тип и допустимые значения. Значение вне схемы игнорируется (остаётся
+-- значение «высокого») — кривой quality.json не ломает рабочий фильтр.
+-- Параметры контура (threshold, smooth_contour, contour_filter, mask_expansion,
+-- feather) плагин применяет только при enable_threshold = true.
+local SEGMENTATION_MODELS = {
+	["models/pphumanseg_fp32.with_runtime_opt.ort"] = true,
+	["models/selfie_segmentation.with_runtime_opt.ort"] = true,
+	["models/selfie_multiclass_256x256.with_runtime_opt.ort"] = true,
+	["models/mediapipe.with_runtime_opt.ort"] = true,
+	["models/SINet_Softmax_simple.with_runtime_opt.ort"] = true,
+	["models/rvm_mobilenetv3_fp32.with_runtime_opt.ort"] = true,
+}
+local CUSTOM_SCHEMA = {
+	{"model_select", "string", SEGMENTATION_MODELS},
+	{"numThreads", "int", 1, 8},
+	{"mask_every_x_frames", "int", 1, 6},
+	{"enable_threshold", "bool"},
+	{"threshold", "double", 0.0, 1.0},
+	{"temporal_smooth_factor", "double", 0.0, 1.0},
+	{"smooth_contour", "double", 0.0, 1.0},
+	{"contour_filter", "double", 0.0, 1.0},
+	{"mask_expansion", "double", -30, 30},
+	{"feather", "double", 0.0, 1.0},
+}
+
+-- Тип значения в JSON: "string" | "bool" | "number" | nil. obs_data_get_double для
+-- строки вернул бы 0, и мусор прошёл бы проверку диапазона как «0».
+local function json_kind(json, key)
+	local v = json:match('"' .. key .. '"%s*:%s*([^,}%s]+)')
+	if v == nil then return nil end
+	if v:sub(1, 1) == '"' then return "string" end
+	if v == "true" or v == "false" then return "bool" end
+	if tonumber(v) ~= nil then return "number" end
+	return nil
+end
+
+local function read_custom(c, profile)
+	local json = obs.obs_data_get_json(c) or ""
+	for _, rule in ipairs(CUSTOM_SCHEMA) do
+		local key, kind = rule[1], rule[2]
+		local actual = json_kind(json, key)
+		local expected = (kind == "int" or kind == "double") and "number" or kind
+		if actual == expected then
+			local v
+			if kind == "string" then
+				v = obs.obs_data_get_string(c, key)
+				if not rule[3][v] then v = nil end
+			elseif kind == "bool" then
+				v = obs.obs_data_get_bool(c, key)
+			else
+				v = kind == "int" and obs.obs_data_get_int(c, key) or obs.obs_data_get_double(c, key)
+				if v < rule[3] or v > rule[4] then v = nil end
+			end
+			if v ~= nil then profile[key] = v end
+		end
+	end
+end
 
 local function read_quality()
 	local d = obs.obs_data_create_from_json_file(QUALITY_FILE)
@@ -125,14 +181,13 @@ local function read_quality()
 		local profile = {}
 		for k, v in pairs(PROFILES.high) do profile[k] = v end
 		local c = obs.obs_data_get_obj(d, "custom")
-		local sig = "custom"
 		if c ~= nil then
-			for _, k in ipairs(CUSTOM_KEYS) do
-				if obs.obs_data_has_user_value(c, k) then profile[k] = obs.obs_data_get_double(c, k) end
-				sig = sig .. ":" .. tostring(profile[k])
-			end
+			read_custom(c, profile)
 			obs.obs_data_release(c)
 		end
+		-- Подпись — по всем полям схемы: любое изменение запускает применение
+		local sig = "custom"
+		for _, rule in ipairs(CUSTOM_SCHEMA) do sig = sig .. ":" .. tostring(profile[rule[1]]) end
 		obs.obs_data_release(d)
 		return sig, profile
 	end
@@ -169,8 +224,8 @@ local function apply_quality()
 end
 
 local applied_cam = nil
-local cam_switched_at = nil
 local camera_shown = nil
+local camera_shown_at = 0
 
 local function canvas_size()
 	local ovi = obs.obs_video_info()
@@ -200,22 +255,64 @@ local function apply_camera()
 		local data = obs.obs_data_create()
 		obs.obs_data_set_string(data, "video_device_id", id)
 		obs.obs_data_set_string(data, "last_video_device_id", id)
-		obs.obs_data_set_int(data, "res_type", 1)
-		obs.obs_data_set_string(data, "resolution", canvas_res())
 		obs.obs_source_update(src, data)
 		obs.obs_data_release(data)
-		applied_cam = id
-		cam_switched_at = os.time()
-	elseif cam_switched_at ~= nil and os.time() - cam_switched_at >= 4 then
-		-- Камера не умеет разрешение холста и молчит — откатываемся на её родное
-		-- (только если она сейчас показана: спрятанная по требованию тоже даёт 0)
-		if camera_shown and obs.obs_source_get_width(src) == 0 then
-			local data = obs.obs_data_create()
+		applied_cam = id  -- режим захвата под кадр выставит sync_camera_mode
+	end
+	obs.obs_source_release(src)
+end
+
+-- Режим захвата камеры = размер кадра. Отдельно от подгонки слоёв: раньше камера
+-- обновлялась только когда менялись границы слоёв, и при совпадающих границах
+-- (кадр 1080p) камера могла остаться в 720p — картинку просто растягивало.
+-- Каждый тик сверяем res_type/resolution с кадром и правим только при расхождении.
+-- Проверяем результат только когда камера показана и успела инициализироваться
+-- (спрятанная по требованию честно даёт размер 0): нет кадров — режим не
+-- поддерживается, запоминаем пару «камера@разрешение» и берём родной режим
+-- камеры, не навязывая неподдерживаемый на каждом тике. Другая камера или
+-- другое разрешение — новая попытка.
+local CAMERA_INIT_GRACE = 5  -- с после включения, прежде чем судить о кадрах
+local mode_key = nil         -- камера@разрешение, к которому сейчас ведём
+local mode_failed = false    -- для mode_key режим не поддержан
+local mode_pending = false   -- запросили режим, результат ещё не проверен
+
+local function sync_camera_mode()
+	local src = obs.obs_get_source_by_name("Камера")
+	if src == nil then return end
+	local st = obs.obs_source_get_settings(src)
+	local dev = obs.obs_data_get_string(st, "video_device_id")
+	local res_type = obs.obs_data_get_int(st, "res_type")
+	local res = obs.obs_data_get_string(st, "resolution")
+	obs.obs_data_release(st)
+	local target = canvas_res()
+	local key = dev .. "@" .. target
+	if key ~= mode_key then
+		mode_key, mode_failed, mode_pending = key, false, false
+	end
+	local data = nil
+	if mode_failed then
+		if res_type ~= 0 then
+			data = obs.obs_data_create()
 			obs.obs_data_set_int(data, "res_type", 0)
-			obs.obs_source_update(src, data)
-			obs.obs_data_release(data)
 		end
-		cam_switched_at = nil
+	elseif res_type ~= 1 or res ~= target then
+		data = obs.obs_data_create()
+		obs.obs_data_set_int(data, "res_type", 1)
+		obs.obs_data_set_string(data, "resolution", target)
+		mode_pending = true
+		print("camera mode -> " .. target)
+	elseif mode_pending and camera_shown and os.time() - camera_shown_at >= CAMERA_INIT_GRACE then
+		if obs.obs_source_get_width(src) == 0 then
+			mode_failed = true
+			data = obs.obs_data_create()
+			obs.obs_data_set_int(data, "res_type", 0)
+			print("camera does not deliver " .. target .. ", using its native mode")
+		end
+		mode_pending = false
+	end
+	if data ~= nil then
+		obs.obs_source_update(src, data)
+		obs.obs_data_release(data)
 	end
 	obs.obs_source_release(src)
 end
@@ -382,6 +479,7 @@ local function camera_on_demand()
 	local show = now - wanted_at < KEEP_ON
 	if show ~= camera_shown and set_camera_shown(show) then
 		camera_shown = show
+		if show then camera_shown_at = now end
 		print(show and "camera on" or "camera off")
 	end
 end
@@ -460,19 +558,7 @@ local function fit_scene()
 		end
 	end
 	obs.obs_source_release(scene_src)
-	if changed then
-		local cam = obs.obs_get_source_by_name("Камера")
-		if cam ~= nil then
-			local data = obs.obs_data_create()
-			obs.obs_data_set_int(data, "res_type", 1)
-			obs.obs_data_set_string(data, "resolution", cw .. "x" .. ch)
-			obs.obs_source_update(cam, data)
-			obs.obs_data_release(data)
-			obs.obs_source_release(cam)
-			cam_switched_at = os.time()  -- не умеет такое разрешение — откат на родное
-		end
-		print("scene fitted to " .. cw .. "x" .. ch)
-	end
+	if changed then print("scene fitted to " .. cw .. "x" .. ch) end  -- режим камеры — в sync_camera_mode
 end
 
 local function apply_resolution()
@@ -508,9 +594,46 @@ local function on_frontend_event(event)
 	end
 end
 
+-- Диагностика: status.json раз в 2 с (без кадров камеры), трей показывает его
+-- в окне «Диагностика». FPS рендера OBS — не частота маски и не то, что уходит
+-- в звонок; трей подписывает это. Ошибка записи не влияет на работу.
+local function write_status()
+	local ok, err = pcall(function()
+		local d = obs.obs_data_create()
+		obs.obs_data_set_int(d, "updated", os.time())
+		local cw, ch = canvas_size()
+		obs.obs_data_set_string(d, "canvas", cw .. "x" .. ch)
+		obs.obs_data_set_double(d, "render_fps", obs.obs_get_active_fps())
+		obs.obs_data_set_double(d, "frame_time_ms", obs.obs_get_average_frame_time_ns() / 1e6)
+		obs.obs_data_set_int(d, "total_frames", obs.obs_get_total_frames())
+		obs.obs_data_set_int(d, "lagged_frames", obs.obs_get_lagged_frames())
+		obs.obs_data_set_bool(d, "camera_shown", camera_shown == true)
+		obs.obs_data_set_int(d, "camera_shown_for", camera_shown and (os.time() - camera_shown_at) or 0)
+		obs.obs_data_set_bool(d, "camera_mode_failed", mode_failed)
+		local src = obs.obs_get_source_by_name("Камера")
+		if src ~= nil then
+			obs.obs_data_set_int(d, "camera_width", obs.obs_source_get_width(src))
+			obs.obs_data_set_int(d, "camera_height", obs.obs_source_get_height(src))
+			local st = obs.obs_source_get_settings(src)
+			obs.obs_data_set_string(d, "camera_requested",
+				obs.obs_data_get_int(st, "res_type") == 1 and obs.obs_data_get_string(st, "resolution") or "native")
+			obs.obs_data_release(st)
+			obs.obs_source_release(src)
+		end
+		obs.obs_data_set_string(d, "quality", applied or "")
+		obs.obs_data_save_json_safe(d, STATUS_FILE, "tmp", "bak")
+		obs.obs_data_release(d)
+	end)
+	if not ok then print("status write failed: " .. tostring(err)) end
+end
+
 local function tick()
 	apply_resolution()
-	if res_pending == nil then fit_scene() end
+	if res_pending == nil then
+		fit_scene()
+		sync_camera_mode()
+	end
+	write_status()
 	apply_mirror()
 	apply_camera()
 	check_preview()
