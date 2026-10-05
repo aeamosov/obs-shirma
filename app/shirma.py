@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -34,7 +35,12 @@ STATE = DATA / "state.json"
 ICON_FILE = DATA / "icon.ico"
 W, H = 1920, 1080
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-STARTUP_LNK = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "Shirma.lnk"
+MAC = sys.platform == "darwin"  # macOS — экспериментально
+if MAC:
+    # Автозапуск на macOS — LaunchAgent: при входе в систему открывает OBS с нашими ключами
+    STARTUP_LNK = Path.home() / "Library" / "LaunchAgents" / "com.github.aeamosov.shirma.plist"
+else:
+    STARTUP_LNK = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "Shirma.lnk"
 
 
 def _config():
@@ -46,10 +52,10 @@ def _config():
 
 CFG = _config()
 DEFAULT_BG = CFG.get("default_background", "Библиотека")
-OBS = Path(CFG.get("obs", r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"))
+OBS = Path(CFG.get("obs", "/Applications/OBS.app" if MAC else r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"))
 OBS_ARGS = (f"--startvirtualcam --minimize-to-tray --disable-updater --disable-shutdown-check "
             f"--profile {CFG.get('profile', 'Shirma')} --collection {CFG.get('collection', 'Shirma')}")
-NO_WINDOW = subprocess.CREATE_NO_WINDOW
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 REPO = CFG.get("repo", "aeamosov/obs-shirma")
 BRANCH = CFG.get("branch", "main")
 
@@ -121,7 +127,41 @@ def import_image(src: Path):
     return dst
 
 
+def osascript(lines, *args):
+    """AppleScript с аргументами через argv — без экранирования кавычек в тексте."""
+    cmd = ["osascript", "-e", "on run argv", *[x for line in lines for x in ("-e", line)], "-e", "end run", *args]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def open_path(path):
+    if MAC:
+        subprocess.Popen(["open", str(path)])
+    else:
+        os.startfile(path)
+
+
+def on_main(fn):
+    """macOS: AppKit работает только из главного потока — меню из фоновых потоков
+    обновляем через очередь главного. На Windows — просто вызов."""
+    if not MAC:
+        return fn()
+    try:
+        from Foundation import NSOperationQueue
+        NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
+    except Exception:
+        fn()
+
+
 def pick_files():
+    if MAC:
+        r = osascript(['set fs to choose file with prompt (item 1 of argv) of type {"public.image"} '
+                       'with multiple selections allowed',
+                       'set out to ""',
+                       'repeat with f in fs',
+                       'set out to out & POSIX path of f & linefeed',
+                       'end repeat',
+                       'return out'], t("Добавить фон", "Add background"))
+        return [Path(x) for x in r.stdout.splitlines() if x.strip()] if r.returncode == 0 else []
     import tkinter as tk
     from tkinter import filedialog
     root = tk.Tk()
@@ -397,12 +437,40 @@ def camera_props_keeper(stop_event):
 
 
 def obs_running():
+    if MAC:
+        return subprocess.run(["pgrep", "-x", "OBS"], capture_output=True).returncode == 0
     out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq obs64.exe", "/NH"],
                          capture_output=True, creationflags=NO_WINDOW).stdout
     return b"obs64.exe" in out
 
 
+def quit_obs():
+    """Сначала вежливо, чтобы OBS закрылся штатно; если не послушался — принудительно."""
+    if MAC:
+        subprocess.run(["osascript", "-e", 'tell application "OBS" to quit'], capture_output=True)
+    else:
+        subprocess.run(["taskkill", "/IM", "obs64.exe"], capture_output=True, creationflags=NO_WINDOW)
+    for _ in range(10):
+        if not obs_running():
+            return
+        time.sleep(0.5)
+    if MAC:
+        subprocess.run(["pkill", "-x", "OBS"], capture_output=True)
+    else:
+        subprocess.run(["taskkill", "/IM", "obs64.exe", "/F"], capture_output=True, creationflags=NO_WINDOW)
+
+
 def set_autostart(enable):
+    if MAC:
+        if enable:
+            import plistlib
+            STARTUP_LNK.parent.mkdir(parents=True, exist_ok=True)
+            with open(STARTUP_LNK, "wb") as f:
+                plistlib.dump({"Label": "com.github.aeamosov.shirma", "RunAtLoad": True,
+                               "ProgramArguments": ["/usr/bin/open", "-a", str(OBS), "--args", *OBS_ARGS.split()]}, f)
+        else:
+            STARTUP_LNK.unlink(missing_ok=True)
+        return
     if enable:
         # Ярлык ведёт прямо на OBS: значок в трее OBS поднимет сам
         ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:VBG_LNK);"
@@ -564,6 +632,11 @@ def latest_version():
 
 
 def ask(text, title="Shirma"):
+    if MAC:
+        yes, no = t("Да", "Yes"), t("Нет", "No")
+        r = osascript(["display dialog (item 1 of argv) with title (item 2 of argv) "
+                       "buttons {item 3 of argv, item 4 of argv} default button 2"], text, title, no, yes)
+        return r.returncode == 0 and r.stdout.strip().endswith(":" + yes)
     MB_YESNO, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST = 0x4, 0x20, 0x10000, 0x40000
     return ctypes.windll.user32.MessageBoxW(None, text, title,
                                             MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST) == 6
@@ -592,10 +665,29 @@ def check_for_update():
 def run_update():
     """Тот же установщик, что и при первой установке, в видимом окне — его вывод и ошибки видны.
     -NoExit: окно не закрывается само, чтобы итог можно было прочитать."""
+    if MAC:
+        # .command открывается в Терминале сам — без разрешения на управление Терминалом
+        url = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/install-mac.sh"
+        script = DATA / "update.command"
+        script.write_text(f'#!/bin/bash\nbash -c "$(curl -fsSL \'{url}\')" -- --update '
+                          f"--repo '{REPO}' --branch '{BRANCH}'\n", encoding="utf-8")
+        script.chmod(0o755)
+        subprocess.Popen(["open", str(script)])
+        return
     url = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/install.ps1"
     cmd = f"& ([scriptblock]::Create((irm '{url}'))) -Update -Repo '{REPO}' -Branch '{BRANCH}'"
     subprocess.Popen(["powershell.exe", "-NoProfile", "-NoExit", "-Command", cmd],
                      creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+
+def tray_heartbeat():
+    """macOS: Lua в OBS поднимает трей заново, если отметка в tray.json старше 20 с."""
+    while True:
+        try:
+            write_json_atomic(DATA / "tray.json", {"ts": int(time.time()), "pid": os.getpid()})
+        except OSError:
+            pass
+        time.sleep(5)
 
 
 def main():
@@ -603,14 +695,22 @@ def main():
     logging.basicConfig(filename=DATA / "shirma.log", level=logging.INFO, encoding="utf-8",
                         format="%(asctime)s %(levelname)s %(message)s")
     # Одна копия: Lua-скрипт OBS запускает нас при каждой загрузке сцены
-    ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\ShirmaTray")
-    if ctypes.windll.kernel32.GetLastError() == 183:
-        return
-    # Без этого Windows рисует меню в 100% и растягивает картинкой — мыло на 125–200%
-    try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
-    except (AttributeError, OSError):
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    if MAC:
+        import fcntl
+        lock = open(DATA / "tray.lock", "w")  # держим открытым до выхода
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+    else:
+        ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\ShirmaTray")
+        if ctypes.windll.kernel32.GetLastError() == 183:
+            return
+        # Без этого Windows рисует меню в 100% и растягивает картинкой — мыло на 125–200%
+        try:
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+        except (AttributeError, OSError):
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
     save_icon_file()
     ensure_active()
@@ -669,7 +769,7 @@ def main():
             added = [import_image(p) for p in pick_files()]
             if added:
                 set_active(added[-1])
-                icon.update_menu()
+                on_main(icon.update_menu)
         threading.Thread(target=work, daemon=True).start()
 
     quality_file = DATA / "quality.json"
@@ -782,6 +882,9 @@ def main():
     diag_open = threading.Event()
 
     def open_diagnostics(icon, _item):
+        if MAC:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--diagnostics"])
+            return
         if diag_open.is_set():
             return
         diag_open.set()
@@ -815,7 +918,7 @@ def main():
                     run_update()
                     # Установщик сам закроет OBS и запустит заново, а OBS поднимет новый трей.
                     # Уходим сразу, чтобы pip мог заменить файлы окружения, которые мы держим.
-                    icon.stop()
+                    on_main(icon.stop)
             except Exception:
                 logging.exception("update")
             finally:
@@ -827,31 +930,25 @@ def main():
         icon.update_menu()
 
     def shutdown(icon, _item):
-        # Сначала вежливо, чтобы OBS закрылся штатно; если не послушался — принудительно
-        subprocess.run(["taskkill", "/IM", "obs64.exe"], capture_output=True, creationflags=NO_WINDOW)
-        for _ in range(10):
-            if not obs_running():
-                break
-            time.sleep(0.5)
-        else:
-            subprocess.run(["taskkill", "/IM", "obs64.exe", "/F"], capture_output=True, creationflags=NO_WINDOW)
+        quit_obs()
         icon.stop()
 
     menu = pystray.Menu(
         pystray.MenuItem(t("Показать превью", "Show preview"), show_preview, default=True),
         pystray.MenuItem(t("Фон", "Background"), pystray.Menu(items)),
         pystray.MenuItem(t("Добавить свой фон…", "Add your own background…"), add),
-        pystray.MenuItem(t("Открыть папку с фонами", "Open backgrounds folder"), lambda *_: os.startfile(BG_DIR)),
+        pystray.MenuItem(t("Открыть папку с фонами", "Open backgrounds folder"), lambda *_: open_path(BG_DIR)),
         pystray.MenuItem(t("Камера", "Camera"), pystray.Menu(camera_items)),
-        pystray.MenuItem(t("Настройки", "Settings"), pystray.Menu(
-            pystray.MenuItem(t("Качество маски", "Mask quality"), pystray.Menu(*[
+        pystray.MenuItem(t("Настройки", "Settings"), pystray.Menu(*[x for x in (
+            None if MAC else pystray.MenuItem(t("Качество маски", "Mask quality"), pystray.Menu(*[
                 pystray.MenuItem(label, set_quality(q), radio=True, checked=lambda _i, q=q: get_quality() == q)
                 for q, label in (("high", t("Высокое", "High")), ("medium", t("Среднее", "Medium")),
                                  ("custom", t("Своё", "Custom")))
                 if q != "custom" or "custom" in read_quality_file()],
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem(t("Настроить маску…", "Tune the mask…"), open_tuner))),
-            pystray.MenuItem(t("Камера: яркость, зум, фокус…", "Camera: brightness, zoom, focus…"), open_camera_settings),
+            None if MAC else pystray.MenuItem(t("Камера: яркость, зум, фокус…", "Camera: brightness, zoom, focus…"),
+                                              open_camera_settings),
             pystray.MenuItem(t("Разрешение", "Resolution"), pystray.Menu(*[
                 pystray.MenuItem(label, set_resolution(hgt), radio=True,
                                  checked=lambda _i, hgt=hgt: get_resolution() == hgt)
@@ -860,11 +957,13 @@ def main():
                 pystray.MenuItem(t("Фон", "Background"), toggle_mirror("background"),
                                  checked=lambda _i: get_mirror().get("background", False)),
                 pystray.MenuItem(t("Камеру", "Camera"), toggle_mirror("camera"),
-                                 checked=lambda _i: get_mirror().get("camera", False)))))),
+                                 checked=lambda _i: get_mirror().get("camera", False)))),
+        ) if x is not None])),
         pystray.MenuItem(t("Диагностика…", "Diagnostics…"), open_diagnostics),
         pystray.MenuItem(t("Обновить Shirma…", "Update Shirma…"), update),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(t("Автозапуск", "Start with Windows"), toggle_autostart, checked=lambda _i: STARTUP_LNK.exists()),
+        pystray.MenuItem(t("Автозапуск", "Start at login" if MAC else "Start with Windows"), toggle_autostart,
+                         checked=lambda _i: STARTUP_LNK.exists()),
         pystray.MenuItem(t("Выключить Shirma", "Quit Shirma"), shutdown),
     )
     icon = pystray.Icon("shirma", make_icon(), t("Shirma — виртуальный фон", "Shirma — virtual background"), menu)
@@ -886,21 +985,33 @@ def main():
                 ensure_active()
             if now != snap or now_cams != cams:
                 snap, cams = now, now_cams
-                icon.update_menu()
+                on_main(icon.update_menu)
 
     def watch_obs():
         # OBS закрыли из его собственного трея — уходим вместе с ним
         time.sleep(20)
         while obs_running():
             time.sleep(3)
-        icon.stop()
+        on_main(icon.stop)
 
     threading.Thread(target=watch_folder, daemon=True).start()
-    threading.Thread(target=promote_tray_icon_once, daemon=True).start()
-    threading.Thread(target=camera_props_keeper, args=(threading.Event(),), daemon=True).start()
     threading.Thread(target=watch_obs, daemon=True).start()
+    if MAC:
+        threading.Thread(target=tray_heartbeat, daemon=True).start()
+        try:  # только значок в строке меню, без значка в Dock
+            import AppKit
+            AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+                AppKit.NSApplicationActivationPolicyAccessory)
+        except Exception:
+            logging.exception("activation policy")
+    else:
+        threading.Thread(target=promote_tray_icon_once, daemon=True).start()
+        threading.Thread(target=camera_props_keeper, args=(threading.Event(),), daemon=True).start()
     icon.run()
 
 
 if __name__ == "__main__":
-    main()
+    if "--diagnostics" in sys.argv:
+        diagnostics_window(DATA / "status.json")
+    else:
+        main()

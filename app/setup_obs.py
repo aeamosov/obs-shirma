@@ -20,7 +20,9 @@ NAME = "Shirma"
 FPS = 30
 RESOLUTIONS = {720: (1280, 720), 1080: (1920, 1080)}
 W, H = RESOLUTIONS[720]  # переопределяется в main() по resolution.json
-OBS_CFG = Path(os.environ["APPDATA"]) / "obs-studio"
+MAC = sys.platform == "darwin"  # macOS — экспериментально
+OBS_CFG = (Path.home() / "Library" / "Application Support" / "obs-studio") if MAC \
+    else Path(os.environ["APPDATA"]) / "obs-studio"
 # Модель — PP-HumanSeg (~7 мс): держит плечи на тёмной одежде и не тормозит видео.
 # Проверено на живых звонках и отвергнуто:
 #   RVM — модель матирования с мягким краем, но на тёмном пиджаке перед тёмным
@@ -43,6 +45,9 @@ QUALITY = {
              "mask_expansion": 4.0, "feather": 0.2},
     "medium": {**_PPHUMAN, "temporal_smooth_factor": 0.85, "smooth_contour": 0.5, "mask_expansion": 2.0, "feather": 0.15},
 }
+# Плагин под macOS — отдельная реализация на CoreML с одной моделью и своими ключами
+# настроек (v2_*): там оставляем его значения по умолчанию, тонкой настройки нет.
+QUALITY_MAC = {"high": {}, "medium": {}}
 DEFAULT_QUALITY = "high"
 FILTER_SETTINGS = {
     "useGPU": "cpu",
@@ -59,7 +64,10 @@ LUA = r"""-- Shirma: поднимает свой значок в трее, уб�
 -- quality.json читаем через obs_data_create_from_json_file: io.open не открывает пути с кириллицей.
 obs = obslua
 local ffi = require("ffi")
-ffi.cdef[[
+-- macOS (экспериментально): Windows-части — значок OBS в трее, мьютекс трея, подсчёт
+-- читателей виртуальной камеры, размер окна превью — там заглушки.
+local IS_MAC = {is_mac}
+if not IS_MAC then ffi.cdef[[
 int MultiByteToWideChar(unsigned int cp, unsigned long flags, const char* src, int cb, wchar_t* dst, int cch);
 void* ShellExecuteW(void* hwnd, const wchar_t* op, const wchar_t* file, const wchar_t* params, const wchar_t* dir, int show);
 typedef struct { unsigned long Data1; unsigned short Data2, Data3; unsigned char Data4[8]; } SHIRMA_GUID;
@@ -85,11 +93,14 @@ typedef struct { long left, top, right, bottom; } SHIRMA_RECT;
 int GetWindowRect(void* hwnd, SHIRMA_RECT* r);
 int GetClientRect(void* hwnd, SHIRMA_RECT* r);
 int SystemParametersInfoW(unsigned int action, unsigned int param, void* pv, unsigned int ini);
-]]
-local kernel32 = ffi.load("kernel32")
-local shell32 = ffi.load("shell32")
-local user32 = ffi.load("user32")
-local ntdll = ffi.load("ntdll")
+]] end
+local kernel32, shell32, user32, ntdll
+if not IS_MAC then
+	kernel32 = ffi.load("kernel32")
+	shell32 = ffi.load("shell32")
+	user32 = ffi.load("user32")
+	ntdll = ffi.load("ntdll")
+end
 
 local function w(s)
 	local n = kernel32.MultiByteToWideChar(65001, 0, s, -1, nil, 0)
@@ -101,14 +112,18 @@ end
 local PYTHONW = [==[{pythonw}]==]
 local SCRIPT = [==[{script}]==]
 local DIR = [==[{dir}]==]
-local QUALITY_FILE = DIR .. "\\quality.json"
-local CAMERA_FILE = DIR .. "\\camera.json"
-local PREVIEW_FILE = DIR .. "\\preview.json"
-local MIRROR_FILE = DIR .. "\\mirror.json"
-local RESOLUTION_FILE = DIR .. "\\resolution.json"
-local STATUS_FILE = DIR .. "\\status.json"
-local BGMODE_FILE = DIR .. "\\bgmode.json"
-local CAMCFG_FILE = DIR .. "\\camera_settings.json"
+local SEP = IS_MAC and "/" or "\\"
+-- Ключ устройства в настройках источника камеры: DirectShow на Windows, AVFoundation на macOS
+local CAM_KEY = IS_MAC and "device" or "video_device_id"
+local QUALITY_FILE = DIR .. SEP .. "quality.json"
+local CAMERA_FILE = DIR .. SEP .. "camera.json"
+local PREVIEW_FILE = DIR .. SEP .. "preview.json"
+local MIRROR_FILE = DIR .. SEP .. "mirror.json"
+local RESOLUTION_FILE = DIR .. SEP .. "resolution.json"
+local STATUS_FILE = DIR .. SEP .. "status.json"
+local BGMODE_FILE = DIR .. SEP .. "bgmode.json"
+local CAMCFG_FILE = DIR .. SEP .. "camera_settings.json"
+local TRAY_FILE = DIR .. SEP .. "tray.json"
 local RESOLUTIONS = {[720] = {1280, 720}, [1080] = {1920, 1080}}
 local PROFILES = {profiles}
 local applied = nil
@@ -254,13 +269,13 @@ local function apply_camera()
 	if src == nil then return end
 	if applied_cam == nil then
 		local cur = obs.obs_source_get_settings(src)
-		applied_cam = obs.obs_data_get_string(cur, "video_device_id")
+		applied_cam = obs.obs_data_get_string(cur, CAM_KEY)
 		obs.obs_data_release(cur)
 	end
 	if id ~= applied_cam then
 		local data = obs.obs_data_create()
-		obs.obs_data_set_string(data, "video_device_id", id)
-		obs.obs_data_set_string(data, "last_video_device_id", id)
+		obs.obs_data_set_string(data, CAM_KEY, id)
+		if not IS_MAC then obs.obs_data_set_string(data, "last_video_device_id", id) end
 		obs.obs_source_update(src, data)
 		obs.obs_data_release(data)
 		applied_cam = id  -- режим захвата под кадр выставит sync_camera_mode
@@ -323,6 +338,43 @@ local function sync_camera_mode()
 	obs.obs_source_release(src)
 end
 
+-- macOS: режим камеры задаётся пресетом AVCaptureSession «ШxВ». Не поддержан камерой
+-- (нет кадров после инициализации) — берём «High», лучший режим, что у неё есть.
+local function sync_camera_mode_mac()
+	local src = obs.obs_get_source_by_name("Камера")
+	if src == nil then return end
+	local st = obs.obs_source_get_settings(src)
+	local dev = obs.obs_data_get_string(st, "device")
+	local preset = obs.obs_data_get_string(st, "preset")
+	local use_preset = obs.obs_data_get_bool(st, "use_preset")
+	obs.obs_data_release(st)
+	local target = canvas_res()
+	local key = dev .. "@" .. target
+	if key ~= mode_key then
+		mode_key, mode_failed, mode_pending = key, false, false
+	end
+	local want = mode_failed and "AVCaptureSessionPresetHigh" or ("AVCaptureSessionPreset" .. target)
+	local data = nil
+	if not use_preset or preset ~= want then
+		data = obs.obs_data_create()
+		obs.obs_data_set_bool(data, "use_preset", true)
+		obs.obs_data_set_string(data, "preset", want)
+		mode_pending = not mode_failed
+		print("camera preset -> " .. want)
+	elseif mode_pending and camera_shown and os.time() - camera_shown_at >= CAMERA_INIT_GRACE then
+		if obs.obs_source_get_width(src) == 0 then
+			mode_failed = true
+			print("camera does not deliver " .. target .. ", using its best preset")
+		end
+		mode_pending = false
+	end
+	if data ~= nil then
+		obs.obs_source_update(src, data)
+		obs.obs_data_release(data)
+	end
+	obs.obs_source_release(src)
+end
+
 -- Значок OBS в трее. Без него OBS не прячет окно при старте (так устроен OBS:
 -- скрытый запуск требует включённого значка), поэтому значок не выключаем
 -- настройкой, а снимаем после старта. Qt держит его на скрытом верхнеуровневом
@@ -342,6 +394,7 @@ local function class_of(hwnd)
 end
 
 local function hide_obs_tray_icon()
+	if IS_MAC then return true end  -- значок OBS в строке меню macOS не трогаем
 	local pid = kernel32.GetCurrentProcessId()
 	local hwnd = nil
 	local removed = false
@@ -373,7 +426,7 @@ local SPI_GETWORKAREA = 0x0030
 local SWP_NOZORDER_NOACTIVATE = 0x0014
 
 local function resize_preview()
-	if os.time() > preview_resize_until then return end
+	if IS_MAC or os.time() > preview_resize_until then return end
 	local pid = kernel32.GetCurrentProcessId()
 	local hwnd = nil
 	while true do
@@ -422,12 +475,28 @@ local SYNCHRONIZE = 0x00100000
 local tray_started_at = 0
 
 local function launch_tray()
-	shell32.ShellExecuteW(nil, w("open"), w(PYTHONW), w('"' .. SCRIPT .. '"'), w(DIR), 1)
+	if IS_MAC then
+		-- «&»: оболочка возвращается сразу, трей живёт отдельным процессом
+		os.execute("'" .. PYTHONW .. "' '" .. SCRIPT .. "' >/dev/null 2>&1 &")
+	else
+		shell32.ShellExecuteW(nil, w("open"), w(PYTHONW), w('"' .. SCRIPT .. '"'), w(DIR), 1)
+	end
 	tray_started_at = os.time()
 end
 
 local function ensure_tray()
 	if os.time() - tray_started_at < 15 then return end
+	if IS_MAC then
+		-- Мьютексов Windows нет: трей раз в 5 с пишет в tray.json отметку времени
+		local d = obs.obs_data_create_from_json_file(TRAY_FILE)
+		local ts = 0
+		if d ~= nil then
+			ts = obs.obs_data_get_int(d, "ts")
+			obs.obs_data_release(d)
+		end
+		if os.time() - ts > 20 then launch_tray() end
+		return
+	end
 	local h = kernel32.OpenMutexW(SYNCHRONIZE, 0, w(TRAY_MUTEX))
 	if h == nil then
 		launch_tray()
@@ -464,7 +533,12 @@ local function apply_bgmode()
 	if filter ~= nil then
 		obs.obs_source_set_enabled(filter, mode ~= "none")
 		local data = obs.obs_data_create()
-		obs.obs_data_set_int(data, "blur_background", blur)
+		if IS_MAC then
+			obs.obs_data_set_bool(data, "v2_BlurBg", blur > 0)
+			if blur > 0 then obs.obs_data_set_int(data, "v2_BlurBg_Factor", blur) end
+		else
+			obs.obs_data_set_int(data, "blur_background", blur)
+		end
 		obs.obs_source_update(filter, data)
 		obs.obs_data_release(data)
 		obs.obs_source_release(filter)
@@ -510,12 +584,13 @@ end
 -- (модуль камеры, загруженный ради списка устройств, дескриптор не держит).
 -- Число дескрипторов объекта = OBS + наш запрос + читатели; запрос ~10 мкс.
 -- Окно превью — любое видимое окно нашего OBS (главное окно скрыто).
-local VCAM_NAME = w("OBSVirtualCamVideo")
+local VCAM_NAME = not IS_MAC and w("OBSVirtualCamVideo") or nil
 local FILE_MAP_READ = 4
 local KEEP_ON = 5  -- с, чтобы камера не мигала при переподключении программы звонка
 local wanted_at = 0
 
 local function vcam_readers()
+	if IS_MAC then return 0 end
 	local h = kernel32.OpenFileMappingW(FILE_MAP_READ, 0, VCAM_NAME)
 	if h == nil then return 0 end
 	local info = ffi.new("SHIRMA_OBI")
@@ -526,6 +601,7 @@ local function vcam_readers()
 end
 
 local function own_window_visible()
+	if IS_MAC then return false end
 	local pid = kernel32.GetCurrentProcessId()
 	local hwnd = nil
 	while true do
@@ -551,7 +627,8 @@ local function camera_on_demand()
 	apply_quality()  -- раз в 0.5 с: ползунки тонкой настройки откликаются быстро
 	apply_bgmode()
 	local now = os.time()
-	if vcam_readers() > 0 or own_window_visible() or now < camcfg_until then wanted_at = now end
+	-- macOS: читателей виртуальной камеры так не посчитать — камера включена, пока работает Shirma
+	if IS_MAC or vcam_readers() > 0 or own_window_visible() or now < camcfg_until then wanted_at = now end
 	local show = now - wanted_at < KEEP_ON
 	if show ~= camera_shown and set_camera_shown(show) then
 		camera_shown = show
@@ -691,8 +768,14 @@ local function write_status()
 			obs.obs_data_set_int(d, "camera_width", obs.obs_source_get_width(src))
 			obs.obs_data_set_int(d, "camera_height", obs.obs_source_get_height(src))
 			local st = obs.obs_source_get_settings(src)
-			obs.obs_data_set_string(d, "camera_requested",
-				obs.obs_data_get_int(st, "res_type") == 1 and obs.obs_data_get_string(st, "resolution") or "native")
+			local req
+			if IS_MAC then
+				req = (obs.obs_data_get_string(st, "preset"):gsub("^AVCaptureSessionPreset", ""))
+				if req == "High" or req == "" then req = "native" end
+			else
+				req = obs.obs_data_get_int(st, "res_type") == 1 and obs.obs_data_get_string(st, "resolution") or "native"
+			end
+			obs.obs_data_set_string(d, "camera_requested", req)
 			obs.obs_data_release(st)
 			obs.obs_source_release(src)
 		end
@@ -707,7 +790,7 @@ local function tick()
 	apply_resolution()
 	if res_pending == nil then
 		fit_scene()
-		sync_camera_mode()
+		if IS_MAC then sync_camera_mode_mac() else sync_camera_mode() end
 	end
 	write_status()
 	apply_mirror()
@@ -749,11 +832,14 @@ def lua_profiles():
         if isinstance(v, bool):
             return "true" if v else "false"
         return f'"{v}"' if isinstance(v, str) else repr(v)
-    rows = [f'{k} = {{{", ".join(f"{a} = {val(b)}" for a, b in p.items())}}}' for k, p in QUALITY.items()]
+    rows = [f'{k} = {{{", ".join(f"{a} = {val(b)}" for a, b in p.items())}}}'
+            for k, p in (QUALITY_MAC if MAC else QUALITY).items()]
     return "{\n\t" + ",\n\t".join(rows) + "\n}"
 
 
 def obs_running():
+    if MAC:
+        return subprocess.run(["pgrep", "-x", "OBS"], capture_output=True).returncode == 0
     out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq obs64.exe", "/NH"], capture_output=True).stdout
     return b"obs64.exe" in out
 
@@ -810,18 +896,25 @@ def item(name, src_uuid, idx, bounds_type, visible=True):
 def write_scene(camera, active_jpg, lua_path):
     bg = source("image_source", "Фон", {"file": active_jpg.as_posix(), "unload": False})
     removal = {"name": "Удаление фона", "uuid": str(uuid.uuid4()), "id": "background_removal",
-               "versioned_id": "background_removal", "enabled": True, "settings": FILTER_SETTINGS,
+               "versioned_id": "background_removal", "enabled": True, "settings": {} if MAC else FILTER_SETTINGS,
                "mixers": 0, "sync": 0, "flags": 0, "volume": 1.0, "balance": 0.5, "muted": False,
                "hotkeys": {}, "private_settings": {}, "filters": []}
-    cam = source("dshow_input", "Камера", {
-        "video_device_id": camera.obs_id, "last_video_device_id": camera.obs_id,
-        "res_type": 1, "resolution": f"{W}x{H}", "frame_interval": 333333, "video_format": 0,
-        "active": True,
-        # Камера включается только когда нужна: Lua показывает её в сцене на время звонка
-        # или превью, а спрятанную OBS отпускает сам (лампочка гаснет)
-        "deactivate_when_not_showing": True}, [removal])
+    if MAC:
+        # AVFoundation: камера по уникальному ID устройства, режим — пресетом (его ведёт Lua)
+        cam = source("macos-avcapture", "Камера", {
+            "device": camera.obs_id, "device_name": camera.name, "use_preset": True,
+            "preset": f"AVCaptureSessionPreset{W}x{H}", "enable_audio": False}, [removal])
+    else:
+        cam = source("dshow_input", "Камера", {
+            "video_device_id": camera.obs_id, "last_video_device_id": camera.obs_id,
+            "res_type": 1, "resolution": f"{W}x{H}", "frame_interval": 333333, "video_format": 0,
+            "active": True,
+            # Камера включается только когда нужна: Lua показывает её в сцене на время звонка
+            # или превью, а спрятанную OBS отпускает сам (лампочка гаснет)
+            "deactivate_when_not_showing": True}, [removal])
     scene = source("scene", NAME, {"id_counter": 2, "custom_size": False,
-                                   "items": [item("Фон", bg["uuid"], 1, 3), item("Камера", cam["uuid"], 2, 2, visible=False)]})
+                                   "items": [item("Фон", bg["uuid"], 1, 3),
+                                             item("Камера", cam["uuid"], 2, 2, visible=MAC)]})
     coll = {"current_scene": NAME, "current_program_scene": NAME, "scene_order": [{"name": NAME}], "name": NAME,
             "sources": [scene, bg, cam], "groups": [], "quick_transitions": [], "transitions": [],
             "saved_projectors": [], "current_transition": "Cut", "transition_duration": 0,
@@ -940,7 +1033,7 @@ def sync_backgrounds(bundled: Path, dst: Path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bundled", default="", help="папка backgrounds из репозитория")
-    ap.add_argument("--obs", required=True, help="путь к obs64.exe")
+    ap.add_argument("--obs", required=True, help="путь к obs64.exe (на macOS — к OBS.app)")
     ap.add_argument("--data", required=True, help="папка данных Shirma")
     ap.add_argument("--camera", default="", help="номер или часть имени камеры")
     ap.add_argument("--default-background", default="Библиотека")
@@ -962,7 +1055,7 @@ def main():
     W, H = RESOLUTIONS.get(hgt, RESOLUTIONS[720])
     if args.bundled:
         sync_backgrounds(Path(args.bundled), data / "backgrounds")
-    pythonw = data / "venv" / "Scripts" / "pythonw.exe"
+    pythonw = data / "venv" / ("bin/python" if MAC else "Scripts/pythonw.exe")
     try:
         current_id = json.loads((data / "camera.json").read_text(encoding="utf-8")).get("id", "")
     except (OSError, ValueError, AttributeError):
@@ -973,7 +1066,8 @@ def main():
     lua = data / "shirma.lua"
     lua.write_text(LUA.replace("{pythonw}", str(pythonw)).replace("{script}", str(app / "shirma.py"))
                    .replace("{dir}", str(data)).replace("{profiles}", lua_profiles())
-                   .replace("{default}", DEFAULT_QUALITY), encoding="utf-8")
+                   .replace("{default}", DEFAULT_QUALITY).replace("{is_mac}", "true" if MAC else "false"),
+                   encoding="utf-8")
     (data / "camera.json").write_text(json.dumps({"id": camera.obs_id, "name": camera.name}, ensure_ascii=False),
                                       encoding="utf-8")
     quality = data / "quality.json"

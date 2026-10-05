@@ -1,0 +1,2 @@
+# bash на macOS не понимает CRLF — скрипты всегда с LF
+*.sh text eol=lf

@@ -2,7 +2,7 @@
 
 # Shirma
 
-Виртуальный фон для звонков на Windows: камера → вырезание человека → любой фон → камера «OBS Virtual Camera», которую видит любая программа для звонков (Zoom, Teams, Телемост, VK Teams, браузер).
+Виртуальный фон для звонков на Windows (и экспериментально на macOS): камера → вырезание человека → любой фон → камера «OBS Virtual Camera», которую видит любая программа для звонков (Zoom, Teams, Телемост, VK Teams, браузер).
 
 Под капотом — [OBS Studio](https://obsproject.com) и плагин [obs-backgroundremoval](https://github.com/royshil/obs-backgroundremoval), но сам OBS вы не видите: Shirma запускает его в трее и даёт маленькое меню рядом с часами.
 
@@ -28,6 +28,26 @@ irm https://raw.githubusercontent.com/aeamosov/obs-shirma/main/install.ps1 | iex
 Повторный запуск команды обновляет Shirma, и ранее выбранная камера сохраняется; то же делает пункт меню **Обновить Shirma…**.
 
 Выбрать камеру без вопроса: `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/aeamosov/obs-shirma/main/install.ps1))) -Camera Logitech`.
+
+### macOS (экспериментально)
+
+Терминал, права администратора не нужны:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/aeamosov/obs-shirma/main/install-mac.sh)"
+```
+
+Ставит OBS (через Homebrew, если он есть, иначе образ с GitHub), плагин obs-backgroundremoval в домашнюю папку, окружение Python, профиль и сцену `Shirma` и приложение **Shirma** в `~/Applications`. При первом запуске macOS спросит две вещи — разрешите обе: доступ OBS к камере и системное расширение OBS Virtual Camera (после разрешения расширения выключите Shirma в её меню и запустите снова).
+
+> Mac-версия собрана по документации OBS и плагина и **на живом Mac ещё не проверялась**. Если попробовали — напишите в [issues](https://github.com/aeamosov/obs-shirma/issues), что сработало, а что нет.
+
+Отличия от Windows:
+
+- плагин под macOS — другая его реализация (CoreML, одна модель), поэтому нет «Качества маски» и тонкой настройки; «Без фона» и «Размытие» есть;
+- камера включена всё время, пока Shirma запущена (на Windows — только во время звонка или превью);
+- в строке меню два значка — Shirma и OBS;
+- нет окна свойств камеры и запоминания её настроек;
+- удаление: `bash -c "$(curl -fsSL https://raw.githubusercontent.com/aeamosov/obs-shirma/main/uninstall-mac.sh)"`.
 
 ## Как пользоваться
 
@@ -128,3 +148,5 @@ irm https://raw.githubusercontent.com/aeamosov/obs-shirma/main/uninstall.ps1 | i
 ## English
 
 **Shirma** (Russian for "folding screen") is a virtual background for video calls on Windows, built on OBS Studio and the obs-backgroundremoval plugin, with OBS hidden in the tray and a tiny tray menu to switch backgrounds. Install with `irm https://raw.githubusercontent.com/aeamosov/obs-shirma/main/install.ps1 | iex`, start "Shirma" from the desktop shortcut, pick the "OBS Virtual Camera" camera in your call app. Any image dropped into `%LOCALAPPDATA%\Shirma\backgrounds` becomes a background named after the file. Camera settings (brightness, zoom, focus) are remembered per camera and restored whenever the camera turns on; **Update Shirma…** in the tray menu checks GitHub and re-runs the installer, keeping your camera and settings. MIT license.
+
+**macOS (experimental, not yet tested on a real Mac):** `bash -c "$(curl -fsSL https://raw.githubusercontent.com/aeamosov/obs-shirma/main/install-mac.sh)"`. Allow OBS camera access and the OBS Virtual Camera system extension on first start. The macOS plugin is a different (CoreML) implementation, so there is no mask quality tuning; the camera stays on while Shirma runs. Remove with `uninstall-mac.sh`. Reports via issues are welcome.

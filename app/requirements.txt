@@ -1,3 +1,4 @@
 pystray>=0.19
 Pillow>=10
-comtypes>=1.4
+# Настройки камеры через DirectShow — только Windows
+comtypes>=1.4; sys_platform == "win32"
