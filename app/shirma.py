@@ -341,6 +341,59 @@ def diagnostics_window(status_file):
     root.mainloop()
 
 
+def camera_props_keeper(stop_event):
+    """Запоминает настройки камеры и возвращает их, когда камера включается.
+
+    Часть камер сбрасывает яркость, зум и т.п. при каждом открытии, а Shirma
+    включает камеру только на время звонка или превью. Порядок важен: сначала
+    вернуть сохранённое, и только потом начинать запоминать — иначе можно
+    сохранить сброшенные значения поверх своих.
+    """
+    import logging
+    try:
+        import camprops
+    except Exception:  # нет comtypes или COM недоступен — без этой функции
+        logging.exception("camera settings keeper disabled")
+        return
+    store = DATA / "camera_props.json"
+    active_since, applied_for = None, None
+    last_save = 0.0
+    while not stop_event.wait(1):
+        try:
+            status = json.loads((DATA / "status.json").read_text(encoding="utf-8"))
+            cam_id = json.loads((DATA / "camera.json").read_text(encoding="utf-8")).get("id", "")
+        except (OSError, ValueError):
+            continue
+        active = bool(status.get("camera_shown")) and status.get("camera_width", 0) > 0 \
+            and time.time() - status.get("updated", 0) < 10
+        cam = next((c for c in list_cameras() if c.obs_id == cam_id), None)
+        if not active or cam is None:
+            active_since, applied_for = None, None
+            continue
+        now = time.time()
+        if active_since is None:
+            active_since = now
+        try:
+            saved = json.loads(store.read_text(encoding="utf-8")) if store.exists() else {}
+        except ValueError:
+            saved = {}
+        try:
+            if applied_for != cam.path and now - active_since >= 1:
+                mine = saved.get(cam.path, {})
+                if mine:
+                    camprops.apply_settings(cam.path, mine)
+                applied_for = cam.path
+            elif applied_for == cam.path and now - active_since >= 4 and now - last_save >= 5:
+                last_save = now
+                current = {k: {"value": v["value"], "auto": v["auto"]}
+                           for k, v in camprops.read_settings(cam.path).items()}
+                if current and current != saved.get(cam.path):
+                    saved[cam.path] = current
+                    write_json_atomic(store, saved)
+        except Exception:
+            logging.exception("camera settings keeper")
+
+
 def obs_running():
     out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq obs64.exe", "/NH"],
                          capture_output=True, creationflags=NO_WINDOW).stdout
@@ -491,6 +544,9 @@ def ensure_active():
 
 
 def main():
+    import logging
+    logging.basicConfig(filename=DATA / "shirma.log", level=logging.INFO, encoding="utf-8",
+                        format="%(asctime)s %(levelname)s %(message)s")
     # Одна копия: Lua-скрипт OBS запускает нас при каждой загрузке сцены
     ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\ShirmaTray")
     if ctypes.windll.kernel32.GetLastError() == 183:
@@ -765,6 +821,7 @@ def main():
 
     threading.Thread(target=watch_folder, daemon=True).start()
     threading.Thread(target=promote_tray_icon_once, daemon=True).start()
+    threading.Thread(target=camera_props_keeper, args=(threading.Event(),), daemon=True).start()
     threading.Thread(target=watch_obs, daemon=True).start()
     icon.run()
 
