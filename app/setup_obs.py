@@ -565,7 +565,19 @@ local function check_camera_settings()
 		end
 		camcfg_seq = seq
 	end
-	if camcfg_pending and camera_shown and os.time() - camera_shown_at >= 2 then
+	-- Жмём, как только камера дала кадры (обычно ~1 с после включения). Фиксированная
+	-- пауза в 2 с вместе с 2-секундным тиком давала 4–6 с до окна. Кадров нет дольше
+	-- 3 с (например, их не даёт антивирус) — всё равно открываем, как раньше.
+	local ready = false
+	if camcfg_pending and camera_shown then
+		local src = obs.obs_get_source_by_name("Камера")
+		if src ~= nil then
+			ready = obs.obs_source_get_width(src) > 0
+			obs.obs_source_release(src)
+		end
+		ready = ready or os.time() - camera_shown_at >= 3
+	end
+	if ready then
 		local src = obs.obs_get_source_by_name("Камера")
 		if src ~= nil then
 			local props = obs.obs_source_properties(src)
@@ -626,6 +638,7 @@ end
 local function camera_on_demand()
 	apply_quality()  -- раз в 0.5 с: ползунки тонкой настройки откликаются быстро
 	apply_bgmode()
+	check_camera_settings()  -- здесь, а не в 2-секундном тике: окно камеры открывается быстрее
 	local now = os.time()
 	-- macOS: читателей виртуальной камеры так не посчитать — камера включена, пока работает Shirma
 	if IS_MAC or vcam_readers() > 0 or own_window_visible() or now < camcfg_until then wanted_at = now end
@@ -797,7 +810,6 @@ local function tick()
 	apply_camera()
 	check_preview()
 	resize_preview()
-	check_camera_settings()
 	hide_obs_tray_icon()  -- снова, если Проводник перезапустился и Qt вернул значок
 	ensure_tray()
 end
