@@ -655,11 +655,13 @@ def check_for_update():
                      f"You have the latest Shirma ({sha[:7]}, {date}).\n\nReinstall anyway?"))
     have = cur[:7] or t("неизвестна", "unknown")
     return ask(t(f"Доступна новая версия Shirma от {date}:\n{msg}\n\nУстановлена: {have}.\n\n"
-                 "Обновить сейчас? Shirma закроется примерно на минуту — если идёт звонок, лучше после него. "
-                 "Установщик откроется в отдельном окне, настройки и свои фоны сохранятся.",
+                 "Обновить сейчас? Shirma выключится — если идёт звонок, лучше после него. "
+                 "Установщик откроется в отдельном окне, настройки и свои фоны сохранятся. "
+                 "Когда он закончит, запустите Shirma ярлыком.",
                  f"A new Shirma version from {date} is available:\n{msg}\n\nInstalled: {have}.\n\n"
-                 "Update now? Shirma will be off for about a minute — if you are in a call, better wait. "
-                 "The installer opens in its own window; your settings and backgrounds are kept."))
+                 "Update now? Shirma will quit — if you are in a call, better wait. "
+                 "The installer opens in its own window; your settings and backgrounds are kept. "
+                 "When it finishes, start Shirma from its shortcut."))
 
 
 def run_update():
@@ -920,7 +922,8 @@ def main():
             try:
                 if check_for_update():
                     run_update()
-                    # Установщик сам закроет OBS и запустит заново, а OBS поднимет новый трей.
+                    # Установщик закроет OBS; запускает Shirma потом сам пользователь ярлыком
+                    # (OBS — потомок этого скрипта — антивирус оставил бы без камеры).
                     # Уходим сразу, чтобы pip мог заменить файлы окружения, которые мы держим.
                     on_main(icon.stop)
             except Exception:

@@ -226,6 +226,19 @@ Refresh-ShortcutIcons
 # Обычный запуск, без обходных путей. Некоторые корпоративные антивирусы не дают камеру
 # процессам, запущенным из скриптов, — тогда в этом сеансе в звонке будет только фон,
 # и достаточно один раз перезапустить Shirma с ярлыка; об этом говорим ниже.
+# Обновление из меню трея: OBS НЕ запускаем. Предок этого окна — Python-скрипт трея,
+# и антивирус (Kaspersky HIPS) отдаёт такому OBS пустые кадры камеры: в звонке был
+# только фон. Запуск ярлыком делает сам пользователь — обходов антивируса не делаем.
+if ($Update) {
+    Remove-Item (Join-Path $env:APPDATA "obs-studio\.sentinel\*") -Force -ErrorAction SilentlyContinue
+    Write-Host ""
+    # Обновление завершено. Запустите Shirma ярлыком «Shirma» на рабочем столе или в меню «Пуск».
+    Write-Host (L "Update finished. Start Shirma from the 'Shirma' shortcut on the desktop or in the Start menu." '\u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u043e. \u0417\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 Shirma \u044f\u0440\u043b\u044b\u043a\u043e\u043c \u00abShirma\u00bb \u043d\u0430 \u0440\u0430\u0431\u043e\u0447\u0435\u043c \u0441\u0442\u043e\u043b\u0435 \u0438\u043b\u0438 \u0432 \u043c\u0435\u043d\u044e \u00ab\u041f\u0443\u0441\u043a\u00bb.') -ForegroundColor Green
+    # Сам установщик её не запускает: OBS, запущенный из меню значка, корпоративный антивирус может оставить без камеры.
+    Write-Host (L "The installer does not start it itself: a corporate antivirus may give no camera to OBS started from the tray menu." '\u0421\u0430\u043c \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0449\u0438\u043a \u0435\u0451 \u043d\u0435 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0435\u0442: OBS, \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u043d\u044b\u0439 \u0438\u0437 \u043c\u0435\u043d\u044e \u0437\u043d\u0430\u0447\u043a\u0430, \u043a\u043e\u0440\u043f\u043e\u0440\u0430\u0442\u0438\u0432\u043d\u044b\u0439 \u0430\u043d\u0442\u0438\u0432\u0438\u0440\u0443\u0441 \u043c\u043e\u0436\u0435\u0442 \u043e\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u0431\u0435\u0437 \u043a\u0430\u043c\u0435\u0440\u044b.')
+    return
+}
+
 # Запуск Shirma
 Step (L "Starting Shirma" '\u0417\u0430\u043f\u0443\u0441\u043a Shirma')
 # После падения OBS предлагает «безопасный режим», а в нём отключены скрипты — то есть
@@ -250,6 +263,3 @@ Write-Host (L "Next time start it from the 'Shirma' desktop shortcut." '\u0412 \
 Write-Host (L "If the call shows only the background without you, your antivirus blocks the camera for apps" '\u0415\u0441\u043b\u0438 \u0432 \u0437\u0432\u043e\u043d\u043a\u0435 \u0432\u0438\u0434\u0435\u043d \u0442\u043e\u043b\u044c\u043a\u043e \u0444\u043e\u043d \u0431\u0435\u0437 \u0432\u0430\u0441 - \u0430\u043d\u0442\u0438\u0432\u0438\u0440\u0443\u0441 \u043d\u0435 \u0434\u0430\u0451\u0442 \u043a\u0430\u043c\u0435\u0440\u0443 \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0430\u043c,')
 # запущенным из скриптов: выключите Shirma в меню значка и запустите её ярлыком.
 Write-Host (L "started by scripts: exit Shirma from the tray menu and start it from the desktop shortcut." '\u0437\u0430\u043f\u0443\u0449\u0435\u043d\u043d\u044b\u043c \u0438\u0437 \u0441\u043a\u0440\u0438\u043f\u0442\u043e\u0432: \u0432\u044b\u043a\u043b\u044e\u0447\u0438\u0442\u0435 Shirma \u0432 \u043c\u0435\u043d\u044e \u0437\u043d\u0430\u0447\u043a\u0430 \u0438 \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0435\u0451 \u044f\u0440\u043b\u044b\u043a\u043e\u043c.')
-if ($Update) { # Обновление завершено - это окно можно закрыть.
-Write-Host ""
-Write-Host (L "Update finished - you can close this window." '\u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u043e - \u044d\u0442\u043e \u043e\u043a\u043d\u043e \u043c\u043e\u0436\u043d\u043e \u0437\u0430\u043a\u0440\u044b\u0442\u044c.') -ForegroundColor Green }
