@@ -174,7 +174,11 @@ end
 
 local function read_quality()
 	local d = obs.obs_data_create_from_json_file(QUALITY_FILE)
-	if d == nil then return "{default}", PROFILES["{default}"] end
+	if d == nil then
+		-- Файла нет — «высокое»; файл есть, но не читается (его как раз пишут) — не трогаем
+		if applied == nil then return "{default}", PROFILES["{default}"] end
+		return applied, nil
+	end
 	local q = obs.obs_data_get_string(d, "quality")
 	if q == "fast" or q == "low" then q = "medium" end  -- старые имена режимов
 	if q == "custom" then
@@ -198,7 +202,7 @@ end
 
 local function apply_quality()
 	local q, profile = read_quality()
-	if q == applied then return end
+	if q == applied or profile == nil then return end
 	local src = obs.obs_get_source_by_name("Камера")
 	if src == nil then return end
 	local filter = obs.obs_source_get_filter_by_name(src, "Удаление фона")

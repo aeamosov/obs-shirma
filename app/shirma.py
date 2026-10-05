@@ -131,55 +131,124 @@ def pick_files():
     return [Path(f) for f in files]
 
 
-# Ползунки тонкой настройки: (ключ фильтра, подпись, мин, макс, шаг, «высокое», развернуть).
+def write_json_atomic(path: Path, data):
+    """Через временный файл и replace: Lua в OBS читает файлы раз в 0.5 с и не должен
+    застать их недописанными (раньше это откатывало «Своё» на «Высокое»)."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# Модели сегментации плагина: (файл, подпись). Первая — рекомендуемая.
+MODELS = [
+    ("models/pphumanseg_fp32.with_runtime_opt.ort", ("PP-HumanSeg — рекомендуется", "PP-HumanSeg — recommended")),
+    ("models/rvm_mobilenetv3_fp32.with_runtime_opt.ort",
+     ("RVM — мягкий край, тяжелее (лучше без чёткой границы)", "RVM — soft edge, heavier (best without hard edge)")),
+    ("models/selfie_segmentation.with_runtime_opt.ort", ("Selfie Segmentation — самая быстрая", "Selfie Segmentation — fastest")),
+    ("models/selfie_multiclass_256x256.with_runtime_opt.ort",
+     ("Selfie Multiclass — точнее, тяжёлая", "Selfie Multiclass — more precise, heavy")),
+    ("models/mediapipe.with_runtime_opt.ort", ("MediaPipe (широкий кадр)", "MediaPipe (landscape)")),
+    ("models/SINet_Softmax_simple.with_runtime_opt.ort", ("SINet", "SINet")),
+]
+MASK_EVERY = [(1, ("каждый кадр", "every frame")), (2, ("через кадр", "every 2nd frame")),
+              (3, ("раз в 3 кадра", "every 3rd frame"))]
+
+# Ползунки: (ключ фильтра, подпись, мин, макс, шаг, «высокое», развернуть, нужен порог).
 # «Развернуть» — показываем наоборот параметру плагина, чтобы «больше» значило «лучше»:
 # порог (ниже — меньше режет одежду) и доля новой маски (ниже — сильнее сглаживание).
+# Запас и мягкость плагин считает на полном разрешении кадра (эрозия/расширение/размытие
+# по всем пикселям каждый кадр): на 1080p большие значения давали 14 к/с вместо 30 —
+# поэтому диапазоны урезаны.
 TUNER = [
     ("threshold", ("Чувствительность (выше — меньше режет одежду)", "Sensitivity (higher keeps more clothing)"),
-     0.2, 0.7, 0.01, 0.4, True),
-    ("mask_expansion", ("Запас вокруг силуэта, px", "Margin around the silhouette, px"), 0, 12, 1, 4, False),
+     0.2, 0.7, 0.01, 0.4, True, True),
+    ("mask_expansion", ("Запас вокруг силуэта, px", "Margin around the silhouette, px"), 0, 8, 1, 4, False, True),
+    ("feather", ("Мягкость края", "Edge softness"), 0.0, 0.3, 0.01, 0.2, False, True),
     ("temporal_smooth_factor", ("Плавность границы во времени (выше — меньше дрожит, но отстаёт)",
-                                "Edge smoothing over time (higher jitters less but lags)"), 0.3, 1.0, 0.01, 0.5, True),
-    ("feather", ("Мягкость края", "Edge softness"), 0.0, 0.5, 0.01, 0.2, False),
+                                "Edge smoothing over time (higher jitters less but lags)"), 0.3, 1.0, 0.01, 0.5,
+     True, False),
 ]
 
 
 def mask_tuner(quality_file, read_quality_file):
-    """Окно с ползунками. Пишет quality.json при каждом изменении — OBS применяет за ~0.5 с."""
+    """Окно настройки маски. Пишет quality.json при каждом изменении — OBS применяет за ~0.5 с."""
     import tkinter as tk
+    from tkinter import ttk
     data = read_quality_file()
     custom = dict(data.get("custom", {}))
     root = tk.Tk()
     root.title(t("Shirma — настройка маски", "Shirma — mask tuning"))
     root.attributes("-topmost", True)
     root.resizable(False, False)
-    pad = {"padx": 14, "pady": 4}
+    pad = {"padx": 14, "pady": 3}
     tk.Label(root, text=t("Изменения видны примерно через полсекунды — удобно держать открытым превью.",
                           "Changes apply in about half a second — keep the preview open."),
-             wraplength=440, justify="left", fg="#555").pack(anchor="w", **pad)
-    vars_ = {}
-    spec = {key: (lo, hi, invert) for key, _l, lo, hi, _s, _d, invert in TUNER}
+             wraplength=460, justify="left", fg="#555").pack(anchor="w", padx=14, pady=(10, 6))
+
+    # --- модель и частота маски --------------------------------------------------
+    model_labels = [t(*lbl) for _, lbl in MODELS]
+    model_by_label = {t(*lbl): f for f, lbl in MODELS}
+    label_by_model = {f: t(*lbl) for f, lbl in MODELS}
+    tk.Label(root, text=t("Модель", "Model")).pack(anchor="w", **pad)
+    model_var = tk.StringVar(value=label_by_model.get(custom.get("model_select"), model_labels[0]))
+    ttk.Combobox(root, textvariable=model_var, values=model_labels, state="readonly", width=56).pack(anchor="w", padx=14)
+    every_labels = [t(*lbl) for _, lbl in MASK_EVERY]
+    every_by_label = {t(*lbl): n for n, lbl in MASK_EVERY}
+    label_by_every = {n: t(*lbl) for n, lbl in MASK_EVERY}
+    tk.Label(root, text=t("Расчёт маски (реже — легче для процессора, но граница отстаёт)",
+                          "Mask update (less often is lighter for the CPU but the edge lags)")).pack(anchor="w", **pad)
+    every_var = tk.StringVar(value=label_by_every.get(int(custom.get("mask_every_x_frames", 1)), every_labels[0]))
+    ttk.Combobox(root, textvariable=every_var, values=every_labels, state="readonly", width=56).pack(anchor="w", padx=14)
+    hard_var = tk.BooleanVar(value=bool(custom.get("enable_threshold", True)))
+    tk.Checkbutton(root, text=t("Чёткая граница (порог) — без неё чувствительность, запас и мягкость не действуют",
+                                "Hard edge (threshold) — without it sensitivity, margin and softness do nothing"),
+                   variable=hard_var, wraplength=460, justify="left").pack(anchor="w", padx=10, pady=(8, 0))
+
+    # --- ползунки ---------------------------------------------------------------
+    vars_, scales = {}, {}
+    spec = {key: (lo, hi, inv) for key, _l, lo, hi, _s, _d, inv, _n in TUNER}
 
     def to_display(key, value):
         lo, hi, invert = spec[key]
-        return lo + hi - value if invert else value
+        return lo + hi - value if invert else value  # обратное преобразование то же
+
+    def refresh_state():
+        for key, *_rest, needs_threshold in TUNER:
+            scales[key].config(state="normal" if hard_var.get() or not needs_threshold else "disabled")
 
     def save(*_):
+        custom["model_select"] = model_by_label.get(model_var.get(), MODELS[0][0])
+        custom["mask_every_x_frames"] = every_by_label.get(every_var.get(), 1)
+        custom["enable_threshold"] = bool(hard_var.get())
         for key, var in vars_.items():
-            custom[key] = round(to_display(key, var.get()), 3)  # обратное преобразование то же
+            custom[key] = round(to_display(key, var.get()), 3)
         out = read_quality_file()
         out.update(quality="custom", custom=custom)
-        quality_file.write_text(json.dumps(out), encoding="utf-8")
+        write_json_atomic(quality_file, out)
+        refresh_state()
 
-    for key, (ru, en), lo, hi, step, default, _inv in TUNER:
+    for key, (ru, en), lo, hi, step, default, _inv, _n in TUNER:
         tk.Label(root, text=t(ru, en)).pack(anchor="w", **pad)
-        var = tk.DoubleVar(value=to_display(key, custom.get(key, default)))
+        cur = min(max(float(custom.get(key, default)), lo), hi)  # старые значения вне нового диапазона
+        var = tk.DoubleVar(value=to_display(key, cur))
         vars_[key] = var
-        tk.Scale(root, from_=lo, to=hi, resolution=step, orient="horizontal", length=440, variable=var,
-                 showvalue=True, command=save).pack(anchor="w", padx=14)
+        scales[key] = tk.Scale(root, from_=lo, to=hi, resolution=step, orient="horizontal", length=460,
+                               variable=var, showvalue=True, command=save)
+        scales[key].pack(anchor="w", padx=14)
+    tk.Label(root, text=t("Запас и мягкость считаются по всему кадру: на 1080p большие значения заметно "
+                          "нагружают процессор — смотрите «Диагностику».",
+                          "Margin and softness are computed over the whole frame: at 1080p large values load the "
+                          "CPU noticeably — check Diagnostics."),
+             wraplength=460, justify="left", fg="#8a5a00").pack(anchor="w", padx=14, pady=(6, 0))
+    model_var.trace_add("write", save)
+    every_var.trace_add("write", save)
+    hard_var.trace_add("write", save)
 
     def reset():
-        for key, _l, _lo, _hi, _s, default, _inv in TUNER:
+        model_var.set(model_labels[0])
+        every_var.set(every_labels[0])
+        hard_var.set(True)
+        for key, _l, _lo, _hi, _s, default, _inv, _n in TUNER:
             vars_[key].set(to_display(key, default))
         save()
 
@@ -486,7 +555,7 @@ def main():
         def _(icon, _item):
             data = read_quality_file()
             data["quality"] = q
-            quality_file.write_text(json.dumps(data), encoding="utf-8")
+            write_json_atomic(quality_file, data)
             icon.update_menu()
         return _
 
@@ -516,8 +585,7 @@ def main():
     def choose_camera(cam):
         # Lua-скрипт в OBS перечитывает файл раз в 2 с и переключает источник на лету
         def _(icon, _item):
-            camera_file.write_text(json.dumps({"id": cam.obs_id, "name": cam.name}, ensure_ascii=False),
-                                   encoding="utf-8")
+            write_json_atomic(camera_file, {"id": cam.obs_id, "name": cam.name})
             icon.update_menu()
         return _
 
@@ -539,7 +607,7 @@ def main():
             seq = json.loads(f.read_text(encoding="utf-8")).get("seq", 0) + 1
         except (OSError, ValueError):
             seq = 1
-        f.write_text(json.dumps({"seq": seq}), encoding="utf-8")
+        write_json_atomic(f, {"seq": seq})
 
     mirror_file = DATA / "mirror.json"
 
@@ -554,7 +622,7 @@ def main():
         def _(icon, _item):
             m = get_mirror()
             m[key] = not m.get(key, False)
-            mirror_file.write_text(json.dumps(m), encoding="utf-8")
+            write_json_atomic(mirror_file, m)
             icon.update_menu()
         return _
 
@@ -569,7 +637,7 @@ def main():
     def set_resolution(hgt):
         # Lua-скрипт в OBS на секунду остановит виртуальную камеру, сменит размер кадра и запустит снова
         def _(icon, _item):
-            resolution_file.write_text(json.dumps({"height": hgt}), encoding="utf-8")
+            write_json_atomic(resolution_file, {"height": hgt})
             icon.update_menu()
         return _
 
