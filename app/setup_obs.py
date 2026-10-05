@@ -758,11 +758,16 @@ def obs_running():
     return b"obs64.exe" in out
 
 
-def pick_camera(wanted):
+def pick_camera(wanted, current_id=""):
     cams = list_cameras()
     if not cams:
         sys.exit(t("Не нашёл ни одной подключённой камеры. Подключите камеру и запустите установку ещё раз.",
                    "No connected camera found. Connect a camera and run the installer again."))
+    if not wanted:
+        # Переустановка или обновление: оставить камеру, выбранную раньше, если она подключена
+        same = [c for c in cams if c.obs_id == current_id]
+        if same:
+            return same[0]
     if wanted:
         if wanted.isdigit() and 1 <= int(wanted) <= len(cams):
             return cams[int(wanted) - 1]
@@ -958,7 +963,11 @@ def main():
     if args.bundled:
         sync_backgrounds(Path(args.bundled), data / "backgrounds")
     pythonw = data / "venv" / "Scripts" / "pythonw.exe"
-    camera = pick_camera(args.camera)
+    try:
+        current_id = json.loads((data / "camera.json").read_text(encoding="utf-8")).get("id", "")
+    except (OSError, ValueError, AttributeError):
+        current_id = ""
+    camera = pick_camera(args.camera, current_id)
     print(t(f"Камера: {camera.name}", f"Camera: {camera.name}"))
 
     lua = data / "shirma.lua"

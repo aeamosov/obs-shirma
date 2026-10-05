@@ -50,6 +50,8 @@ OBS = Path(CFG.get("obs", r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"))
 OBS_ARGS = (f"--startvirtualcam --minimize-to-tray --disable-updater --disable-shutdown-check "
             f"--profile {CFG.get('profile', 'Shirma')} --collection {CFG.get('collection', 'Shirma')}")
 NO_WINDOW = subprocess.CREATE_NO_WINDOW
+REPO = CFG.get("repo", "aeamosov/obs-shirma")
+BRANCH = CFG.get("branch", "main")
 
 
 def read_state():
@@ -543,6 +545,59 @@ def ensure_active():
     set_active(moved or default)
 
 
+def installed_version():
+    """sha коммита, из которого поставлена Shirma (пишет установщик); пусто — неизвестно."""
+    try:
+        return json.loads((DATA / "version.json").read_text(encoding="utf-8-sig")).get("sha") or ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def latest_version():
+    """(sha, дата, первая строка сообщения) последнего коммита ветки на GitHub."""
+    import urllib.request
+    req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/commits/{BRANCH}",
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "Shirma"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        d = json.load(r)
+    return d["sha"], d["commit"]["committer"]["date"][:10], d["commit"]["message"].splitlines()[0]
+
+
+def ask(text, title="Shirma"):
+    MB_YESNO, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST = 0x4, 0x20, 0x10000, 0x40000
+    return ctypes.windll.user32.MessageBoxW(None, text, title,
+                                            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST) == 6
+
+
+def check_for_update():
+    """Сравнить установленную версию с GitHub и спросить, обновлять ли. True — обновлять."""
+    cur = installed_version()
+    try:
+        sha, date, msg = latest_version()
+    except Exception as e:  # нет сети, прокси, лимит API — дать обновиться и без проверки
+        return ask(t(f"Не удалось проверить обновления: {e}\n\nЗапустить обновление всё равно?",
+                     f"Could not check for updates: {e}\n\nRun the update anyway?"))
+    if cur == sha:
+        return ask(t(f"Установлена последняя версия Shirma ({sha[:7]}, {date}).\n\nПереустановить всё равно?",
+                     f"You have the latest Shirma ({sha[:7]}, {date}).\n\nReinstall anyway?"))
+    have = cur[:7] or t("неизвестна", "unknown")
+    return ask(t(f"Доступна новая версия Shirma от {date}:\n{msg}\n\nУстановлена: {have}.\n\n"
+                 "Обновить сейчас? Shirma закроется примерно на минуту — если идёт звонок, лучше после него. "
+                 "Установщик откроется в отдельном окне, настройки и свои фоны сохранятся.",
+                 f"A new Shirma version from {date} is available:\n{msg}\n\nInstalled: {have}.\n\n"
+                 "Update now? Shirma will be off for about a minute — if you are in a call, better wait. "
+                 "The installer opens in its own window; your settings and backgrounds are kept."))
+
+
+def run_update():
+    """Тот же установщик, что и при первой установке, в видимом окне — его вывод и ошибки видны.
+    -NoExit: окно не закрывается само, чтобы итог можно было прочитать."""
+    url = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/install.ps1"
+    cmd = f"& ([scriptblock]::Create((irm '{url}'))) -Update -Repo '{REPO}' -Branch '{BRANCH}'"
+    subprocess.Popen(["powershell.exe", "-NoProfile", "-NoExit", "-Command", cmd],
+                     creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+
 def main():
     import logging
     logging.basicConfig(filename=DATA / "shirma.log", level=logging.INFO, encoding="utf-8",
@@ -747,6 +802,26 @@ def main():
             seq = 1
         write_json_atomic(f, {"seq": seq})
 
+    updating = threading.Event()
+
+    def update(icon, _item):
+        if updating.is_set():
+            return
+        updating.set()
+
+        def work():
+            try:
+                if check_for_update():
+                    run_update()
+                    # Установщик сам закроет OBS и запустит заново, а OBS поднимет новый трей.
+                    # Уходим сразу, чтобы pip мог заменить файлы окружения, которые мы держим.
+                    icon.stop()
+            except Exception:
+                logging.exception("update")
+            finally:
+                updating.clear()
+        threading.Thread(target=work, daemon=True).start()
+
     def toggle_autostart(icon, _item):
         set_autostart(not STARTUP_LNK.exists())
         icon.update_menu()
@@ -787,6 +862,7 @@ def main():
                 pystray.MenuItem(t("Камеру", "Camera"), toggle_mirror("camera"),
                                  checked=lambda _i: get_mirror().get("camera", False)))))),
         pystray.MenuItem(t("Диагностика…", "Diagnostics…"), open_diagnostics),
+        pystray.MenuItem(t("Обновить Shirma…", "Update Shirma…"), update),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(t("Автозапуск", "Start with Windows"), toggle_autostart, checked=lambda _i: STARTUP_LNK.exists()),
         pystray.MenuItem(t("Выключить Shirma", "Quit Shirma"), shutdown),

@@ -15,7 +15,8 @@
 param(
     [string]$Camera = "",      # номер или часть имени камеры; пусто — спросит, если камер несколько
     [string]$Repo = "aeamosov/obs-shirma",
-    [string]$Branch = "main"
+    [string]$Branch = "main",
+    [switch]$Update            # запуск из меню трея «Обновить»: согласие уже дали там, OBS закрываем без вопроса
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,7 +66,9 @@ function Find-Obs {
 # сначала штатно, а если не послушался (например, закрылось только окно превью) — принудительно.
 function Close-Obs([switch]$Ask) {
     if (-not (Get-Process obs64 -ErrorAction SilentlyContinue)) { return }
-    if ($Ask) { # OBS запущен. Нажмите Enter, чтобы закрыть его и продолжить
+    if ($Ask -and $Update) { # Закрываю OBS для обновления
+Write-Host (L "    Closing OBS for the update" '    \u0417\u0430\u043a\u0440\u044b\u0432\u0430\u044e OBS \u0434\u043b\u044f \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f') }
+    elseif ($Ask) { # OBS запущен. Нажмите Enter, чтобы закрыть его и продолжить
 Read-Host (L "    OBS is running. Press Enter to close it and continue" '    OBS \u0437\u0430\u043f\u0443\u0449\u0435\u043d. \u041d\u0430\u0436\u043c\u0438\u0442\u0435 Enter, \u0447\u0442\u043e\u0431\u044b \u0437\u0430\u043a\u0440\u044b\u0442\u044c \u0435\u0433\u043e \u0438 \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c') | Out-Null }
     else { # OBS снова запущен - закрываю
 Write-Host (L "    OBS was started again - closing it" '    OBS \u0441\u043d\u043e\u0432\u0430 \u0437\u0430\u043f\u0443\u0449\u0435\u043d - \u0437\u0430\u043a\u0440\u044b\u0432\u0430\u044e') }
@@ -147,18 +150,27 @@ Write-Host "    $Py"
 # Файлы Shirma -> {0}
 Step ((L "Shirma files -> {0}" '\u0424\u0430\u0439\u043b\u044b Shirma -> {0}') -f $Data)
 $Src = $null
+$Version = ""  # sha коммита — по нему пункт трея «Обновить» понимает, есть ли новая версия
 if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "app\shirma.py"))) {
     $Src = $PSScriptRoot  # запуск из клона репозитория
+    if (Have "git") { try { $Version = "$(git -C $Src rev-parse HEAD 2>$null)".Trim() } catch {} }
 } else {
     $tmp = Join-Path $env:TEMP "shirma-src"
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory $tmp | Out-Null
-    Invoke-WebRequest "https://github.com/$Repo/archive/refs/heads/$Branch.zip" -OutFile "$tmp\src.zip"
+    # Архив качаем по sha, а не по ветке: тогда записанная версия точно совпадает с файлами
+    $zipUrl = "https://github.com/$Repo/archive/refs/heads/$Branch.zip"
+    try {
+        $Version = (Invoke-RestMethod "https://api.github.com/repos/$Repo/commits/$Branch").sha
+        if ($Version) { $zipUrl = "https://github.com/$Repo/archive/$Version.zip" }
+    } catch { $Version = "" }
+    Invoke-WebRequest $zipUrl -OutFile "$tmp\src.zip"
     Expand-Archive "$tmp\src.zip" $tmp -Force
     $Src = (Get-ChildItem $tmp -Directory | Select-Object -First 1).FullName
 }
 New-Item -ItemType Directory "$Data\app", "$Data\backgrounds" -Force | Out-Null
 Copy-Item "$Src\app\*" "$Data\app" -Recurse -Force
+@{ sha = $Version; repo = $Repo; branch = $Branch } | ConvertTo-Json | Set-Content "$Data\version.json" -Encoding ASCII
 # Фоны раскладывает setup_obs.py (шаг 6): имена русские, а здесь допустим только ASCII
 
 # --- 5. Окружение Python -----------------------------------------------------
@@ -229,3 +241,6 @@ Write-Host (L "Next time start it from the 'Shirma' desktop shortcut." '\u0412 \
 Write-Host (L "If the call shows only the background without you, your antivirus blocks the camera for apps" '\u0415\u0441\u043b\u0438 \u0432 \u0437\u0432\u043e\u043d\u043a\u0435 \u0432\u0438\u0434\u0435\u043d \u0442\u043e\u043b\u044c\u043a\u043e \u0444\u043e\u043d \u0431\u0435\u0437 \u0432\u0430\u0441 - \u0430\u043d\u0442\u0438\u0432\u0438\u0440\u0443\u0441 \u043d\u0435 \u0434\u0430\u0451\u0442 \u043a\u0430\u043c\u0435\u0440\u0443 \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0430\u043c,')
 # запущенным из скриптов: выключите Shirma в меню значка и запустите её ярлыком.
 Write-Host (L "started by scripts: exit Shirma from the tray menu and start it from the desktop shortcut." '\u0437\u0430\u043f\u0443\u0449\u0435\u043d\u043d\u044b\u043c \u0438\u0437 \u0441\u043a\u0440\u0438\u043f\u0442\u043e\u0432: \u0432\u044b\u043a\u043b\u044e\u0447\u0438\u0442\u0435 Shirma \u0432 \u043c\u0435\u043d\u044e \u0437\u043d\u0430\u0447\u043a\u0430 \u0438 \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0435\u0451 \u044f\u0440\u043b\u044b\u043a\u043e\u043c.')
+if ($Update) { # Обновление завершено - это окно можно закрыть.
+Write-Host ""
+Write-Host (L "Update finished - you can close this window." '\u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u043e - \u044d\u0442\u043e \u043e\u043a\u043d\u043e \u043c\u043e\u0436\u043d\u043e \u0437\u0430\u043a\u0440\u044b\u0442\u044c.') -ForegroundColor Green }

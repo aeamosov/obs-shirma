@@ -25,6 +25,8 @@ irm https://raw.githubusercontent.com/aeamosov/obs-shirma/main/install.ps1 | iex
 5. находит камеру (если камер несколько — спросит, какую взять) и создаёт в OBS **отдельные** профиль и сцену `Shirma` — ваши профили и сцены не трогает;
 6. создаёт ярлык Shirma на рабочем столе и в меню «Пуск».
 
+Повторный запуск команды обновляет Shirma, и ранее выбранная камера сохраняется; то же делает пункт меню **Обновить Shirma…**.
+
 Выбрать камеру без вопроса: `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/aeamosov/obs-shirma/main/install.ps1))) -Camera Logitech`.
 
 ## Как пользоваться
@@ -40,9 +42,10 @@ irm https://raw.githubusercontent.com/aeamosov/obs-shirma/main/install.ps1 | iex
    - **Камера** — выбрать камеру из подключённых, переключается на лету;
    - **Настройки ▸ Отразить по горизонтали** — отдельно фон и камеру (программы звонка и так показывают вам ваше изображение зеркально, собеседники видят без отражения — отражённая камера перевернёт для них надписи);
    - **Настройки ▸ Качество маски** — высокое (по умолчанию), среднее или своё; **Настроить маску…** — окно с ползунками: чувствительность (меньше режет одежду), запас вокруг силуэта, плавность границы во времени, мягкость края. Изменения видны примерно через полсекунды;
-   - **Настройки ▸ Камера: яркость, зум, фокус…** — штатное окно свойств драйвера камеры (набор настроек зависит от камеры); на время окна камера включается;
+   - **Настройки ▸ Камера: яркость, зум, фокус…** — штатное окно свойств драйвера камеры (набор настроек зависит от камеры); на время окна камера включается. Shirma запоминает эти значения для каждой камеры и возвращает их при каждом включении — часть камер сбрасывает яркость и зум, когда их открывают заново;
    - **Настройки ▸ Разрешение** — 720p (по умолчанию) или 1080p; при смене виртуальная камера на секунду перезапускается;
    - **Диагностика…** — реальное разрешение камеры и что запрошено, размер кадра, FPS рендера OBS, доля опоздавших кадров за 10 секунд; кнопка «Скопировать сводку» для разбора проблем;
+   - **Обновить Shirma…** — сверяет установленную версию с GitHub и, если вы согласны, запускает тот же установщик в отдельном окне. Камера и все настройки сохраняются; Shirma выключится примерно на минуту, поэтому лучше не во время звонка;
    - **Автозапуск** — запускать вместе с Windows (по умолчанию выключено; пока Shirma запущена, камера включена);
    - **Выключить Shirma** — закрыть OBS и значок.
 
@@ -124,4 +127,4 @@ irm https://raw.githubusercontent.com/aeamosov/obs-shirma/main/uninstall.ps1 | i
 
 ## English
 
-**Shirma** (Russian for "folding screen") is a virtual background for video calls on Windows, built on OBS Studio and the obs-backgroundremoval plugin, with OBS hidden in the tray and a tiny tray menu to switch backgrounds. Install with `irm https://raw.githubusercontent.com/aeamosov/obs-shirma/main/install.ps1 | iex`, start "Shirma" from the desktop shortcut, pick the "OBS Virtual Camera" camera in your call app. Any image dropped into `%LOCALAPPDATA%\Shirma\backgrounds` becomes a background named after the file. MIT license.
+**Shirma** (Russian for "folding screen") is a virtual background for video calls on Windows, built on OBS Studio and the obs-backgroundremoval plugin, with OBS hidden in the tray and a tiny tray menu to switch backgrounds. Install with `irm https://raw.githubusercontent.com/aeamosov/obs-shirma/main/install.ps1 | iex`, start "Shirma" from the desktop shortcut, pick the "OBS Virtual Camera" camera in your call app. Any image dropped into `%LOCALAPPDATA%\Shirma\backgrounds` becomes a background named after the file. Camera settings (brightness, zoom, focus) are remembered per camera and restored whenever the camera turns on; **Update Shirma…** in the tray menu checks GitHub and re-runs the installer, keeping your camera and settings. MIT license.
