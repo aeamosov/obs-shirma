@@ -676,7 +676,11 @@ def run_update():
         return
     url = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/install.ps1"
     cmd = f"& ([scriptblock]::Create((irm '{url}'))) -Update -Repo '{REPO}' -Branch '{BRANCH}'"
-    subprocess.Popen(["powershell.exe", "-NoProfile", "-NoExit", "-Command", cmd],
+    # PSModulePath мог достаться от PowerShell 7 (через OBS, запущенный из pwsh): с ним
+    # Windows PowerShell берёт модули седьмой версии и не может их загрузить. Без
+    # переменной он строит свой путь по умолчанию — так же делает сам pwsh для дочернего powershell.exe.
+    env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+    subprocess.Popen(["powershell.exe", "-NoProfile", "-NoExit", "-Command", cmd], env=env,
                      creationflags=subprocess.CREATE_NEW_CONSOLE)
 
 

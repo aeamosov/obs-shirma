@@ -77,6 +77,15 @@ Write-Host (L "    OBS was started again - closing it" '    OBS \u0441\u043d\u04
     if (Get-Process obs64 -ErrorAction SilentlyContinue) { taskkill /F /IM obs64.exe 2>&1 | Out-Null; Start-Sleep 1 }
 }
 
+# Распаковка zip через .NET, а не Expand-Archive: если PowerShell запущен не из
+# PowerShell 7, а, например, из трея, ему достаётся PSModulePath седьмой версии,
+# Windows PowerShell находит там её модуль Archive, а политика выполнения не даёт
+# его загрузить (так падало «Обновить Shirma…»). Папка назначения должна быть новой.
+function Expand-Zip([string]$zip, [string]$dest) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $dest)
+}
+
 function Refresh-Path {
     $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
                 [Environment]::GetEnvironmentVariable("Path", "User")
@@ -125,7 +134,7 @@ throw ((L "No Windows build of the plugin in release {0}." '\u0412 \u0440\u0435\
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory $tmp | Out-Null
     Invoke-WebRequest $asset.browser_download_url -OutFile "$tmp\plugin.zip"
-    Expand-Archive "$tmp\plugin.zip" "$tmp\x" -Force
+    Expand-Zip "$tmp\plugin.zip" "$tmp\x"
     New-Item -ItemType Directory $PluginRoot -Force | Out-Null
     Copy-Item "$tmp\x\obs-backgroundremoval" $PluginRoot -Recurse -Force
     Remove-Item $tmp -Recurse -Force
@@ -165,7 +174,7 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "app\shirma.py"))) {
         if ($Version) { $zipUrl = "https://github.com/$Repo/archive/$Version.zip" }
     } catch { $Version = "" }
     Invoke-WebRequest $zipUrl -OutFile "$tmp\src.zip"
-    Expand-Archive "$tmp\src.zip" $tmp -Force
+    Expand-Zip "$tmp\src.zip" $tmp
     $Src = (Get-ChildItem $tmp -Directory | Select-Object -First 1).FullName
 }
 New-Item -ItemType Directory "$Data\app", "$Data\backgrounds" -Force | Out-Null
