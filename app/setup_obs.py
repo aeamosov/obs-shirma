@@ -93,6 +93,8 @@ typedef struct { long left, top, right, bottom; } SHIRMA_RECT;
 int GetWindowRect(void* hwnd, SHIRMA_RECT* r);
 int GetClientRect(void* hwnd, SHIRMA_RECT* r);
 int SystemParametersInfoW(unsigned int action, unsigned int param, void* pv, unsigned int ini);
+int InternalGetWindowText(void* hwnd, wchar_t* buf, int len);
+int PostMessageW(void* hwnd, unsigned int msg, uintptr_t wparam, intptr_t lparam);
 ]] end
 local kernel32, shell32, user32, ntdll
 if not IS_MAC then
@@ -124,6 +126,7 @@ local STATUS_FILE = DIR .. SEP .. "status.json"
 local BGMODE_FILE = DIR .. SEP .. "bgmode.json"
 local CAMCFG_FILE = DIR .. SEP .. "camera_settings.json"
 local TRAY_FILE = DIR .. SEP .. "tray.json"
+local QUIT_FILE = DIR .. SEP .. "quit.json"
 local RESOLUTIONS = {[720] = {1280, 720}, [1080] = {1920, 1080}}
 local PROFILES = {profiles}
 local applied = nil
@@ -468,6 +471,78 @@ local function check_preview()
 	preview_seq = seq
 end
 
+-- «Выключить Shirma»: трей пишет в quit.json новый номер запроса, а закрываем OBS
+-- отсюда — штатно, как пункт «Выход» его меню. taskkill без /F для этого не годится:
+-- при открытом проекторе он закрывает только проектор, а при работающей виртуальной
+-- камере OBS спрашивает «Выйти?» (ConfirmOnExit). Трей через 5 с добивал его /F,
+-- метка запуска оставалась, и каждый следующий запуск встречал диалог безопасного
+-- режима. Поэтому сначала останавливаем камеру, потом шлём WM_CLOSE главному окну.
+local WM_CLOSE = 0x0010
+local QUIT_STOP_WAIT = 3  -- с: не дождались остановки камеры — закрываем всё равно
+local quit_seq = nil
+local quitting = false    -- OBS закрывается: камеру не включаем, трей не поднимаем
+local quit_at = 0
+local quit_sent = false
+
+local function window_title(hwnd)
+	-- InternalGetWindowText не шлёт окну сообщений: из графического потока
+	-- GetWindowText окну своего же интерфейса мог бы ждать занятый поток Qt
+	local buf = ffi.new("wchar_t[64]")
+	local n = user32.InternalGetWindowText(hwnd, buf, 64)
+	local out = {}
+	for i = 0, n - 1 do
+		local c = buf[i]
+		out[#out + 1] = c < 128 and string.char(c) or "?"
+	end
+	return table.concat(out)
+end
+
+local function close_obs()
+	quit_sent = true
+	local pid = kernel32.GetCurrentProcessId()
+	local hwnd, main, own = nil, nil, {}
+	while true do
+		hwnd = user32.FindWindowExW(nil, hwnd, nil, nil)
+		if hwnd == nil then break end
+		local owner = ffi.new("unsigned long[1]")
+		user32.GetWindowThreadProcessId(hwnd, owner)
+		if owner[0] == pid and class_of(hwnd):find("QWindowIcon", 1, true) then
+			-- Главное окно называется «OBS <версия> - Профиль: …», проектор — по-своему
+			if window_title(hwnd):sub(1, 4) == "OBS " then main = hwnd end
+			own[#own + 1] = hwnd
+		end
+	end
+	-- Главное закрывает и проекторы; не нашли его — закрываем все свои окна Qt
+	for _, h in ipairs(main ~= nil and {main} or own) do user32.PostMessageW(h, WM_CLOSE, 0, 0) end
+	print("quit: closing OBS (" .. (main ~= nil and "main window" or #own .. " windows") .. ")")
+end
+
+local function check_quit()
+	if IS_MAC then return end  -- на macOS трей закрывает OBS сам (osascript quit)
+	if quitting then
+		if not quit_sent and os.time() - quit_at >= QUIT_STOP_WAIT then close_obs() end
+		return
+	end
+	local d = obs.obs_data_create_from_json_file(QUIT_FILE)
+	if d == nil then
+		if quit_seq == nil then quit_seq = 0 end  -- файла нет — запросов ещё не было
+		return
+	end
+	local seq = obs.obs_data_get_int(d, "seq")
+	obs.obs_data_release(d)
+	-- Первое чтение только запоминает номер: старый запрос не должен закрыть новый запуск
+	if quit_seq ~= nil and seq ~= quit_seq then
+		quitting, quit_at = true, os.time()
+		if obs.obs_frontend_virtualcam_active() then
+			obs.obs_frontend_stop_virtualcam()  -- закроем по событию VIRTUALCAM_STOPPED
+			print("quit: stopping the virtual camera")
+		else
+			close_obs()
+		end
+	end
+	quit_seq = seq
+end
+
 -- Значок Shirma — единственный способ выключить скрытый OBS, поэтому если он
 -- закрылся (упал), поднимаем его снова. Жив ли он — по его мьютексу.
 local TRAY_MUTEX = "Local\\ShirmaTray"
@@ -485,7 +560,7 @@ local function launch_tray()
 end
 
 local function ensure_tray()
-	if os.time() - tray_started_at < 15 then return end
+	if quitting or os.time() - tray_started_at < 15 then return end
 	if IS_MAC then
 		-- Мьютексов Windows нет: трей раз в 5 с пишет в tray.json отметку времени
 		local d = obs.obs_data_create_from_json_file(TRAY_FILE)
@@ -636,6 +711,8 @@ local function set_camera_shown(show)
 end
 
 local function camera_on_demand()
+	check_quit()
+	if quitting then return end
 	apply_quality()  -- раз в 0.5 с: ползунки тонкой настройки откликаются быстро
 	apply_bgmode()
 	check_camera_settings()  -- здесь, а не в 2-секундном тике: окно камеры открывается быстрее
@@ -728,7 +805,7 @@ local function fit_scene()
 end
 
 local function apply_resolution()
-	if res_pending ~= nil then return end
+	if quitting or res_pending ~= nil then return end
 	local hgt = wanted_height()
 	if hgt == nil then return end
 	local _, ch = canvas_size()
@@ -742,6 +819,15 @@ local function apply_resolution()
 end
 
 local function on_frontend_event(event)
+	if event == obs.OBS_FRONTEND_EVENT_EXIT or event == obs.OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN then
+		-- OBS закрывается (как угодно): прежде камера успевала включиться посреди выхода
+		quitting, quit_sent = true, true
+		return
+	end
+	if quitting then
+		if event == obs.OBS_FRONTEND_EVENT_VIRTUALCAM_STOPPED and not quit_sent then close_obs() end
+		return
+	end
 	if res_pending == nil then return end
 	if event == obs.OBS_FRONTEND_EVENT_VIRTUALCAM_STARTED then
 		obs.obs_frontend_stop_virtualcam()

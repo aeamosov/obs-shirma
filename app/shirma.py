@@ -436,28 +436,129 @@ def camera_props_keeper(stop_event):
             logging.exception("camera settings keeper")
 
 
+QUIT_FILE = DATA / "quit.json"
+# Метки запуска OBS 32: кладёт при старте, убирает свою при штатном выходе
+SENTINEL_DIR = Path(os.environ.get("APPDATA", "")) / "obs-studio" / ".sentinel"
+_own_obs = None  # (pid, дескриптор процесса) — OBS, который поднял этот трей
+
+
+def find_own_obs(exe="obs64.exe"):
+    """Наш OBS — предок трея (Lua запускает pythonw venv, тот — настоящий pythonw).
+
+    Сверять по имени obs64.exe нельзя: рядом может работать другой OBS (с --multi,
+    как у «Эха»), и «Выключить» закрывало бы его, а трей не уходил бы, пока тот жив.
+    Дескриптор держим открытым: пока он открыт, PID не достанется другому процессу.
+    """
+    global _own_obs
+    if MAC:
+        return
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.OpenProcess.restype = wintypes.HANDLE
+    snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snap in (None, wintypes.HANDLE(-1).value):
+        return
+    procs = {}
+    try:
+        e = PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(e)
+        ok = k32.Process32FirstW(wintypes.HANDLE(snap), ctypes.byref(e))
+        while ok:
+            procs[e.th32ProcessID] = (e.th32ParentProcessID, e.szExeFile.lower())
+            ok = k32.Process32NextW(wintypes.HANDLE(snap), ctypes.byref(e))
+    finally:
+        k32.CloseHandle(wintypes.HANDLE(snap))
+    pid = os.getpid()
+    for _ in range(4):
+        pid = procs.get(pid, (0, ""))[0]
+        if pid not in procs:
+            return
+        if procs[pid][1] == exe:
+            h = k32.OpenProcess(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+            if h:
+                _own_obs = (pid, h)
+            return
+
+
 def obs_running():
     if MAC:
         return subprocess.run(["pgrep", "-x", "OBS"], capture_output=True).returncode == 0
+    if _own_obs:
+        return ctypes.windll.kernel32.WaitForSingleObject(ctypes.c_void_p(_own_obs[1]), 0) == 0x102  # WAIT_TIMEOUT
     out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq obs64.exe", "/NH"],
                          capture_output=True, creationflags=NO_WINDOW).stdout
     return b"obs64.exe" in out
 
 
+def wait_obs_exit(seconds):
+    end = time.monotonic() + seconds
+    while obs_running():
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.25)
+    return True
+
+
+def clear_crash_sentinels(keep_newest=False):
+    r"""Убрать осиротевшие метки запуска OBS (%APPDATA%\obs-studio\.sentinel\run_*).
+
+    Метка остаётся, если OBS не закрылся штатно (убили, выключили компьютер), и тогда
+    КАЖДЫЙ следующий запуск показывает «OBS не был закрыт должным образом» с выбором
+    безопасного режима — а в нём скрипты выключены, то есть Shirma не работает.
+    Старые метки OBS сам не убирает, --disable-shutdown-check диалог не гасит.
+    keep_newest — OBS сейчас работает: самая свежая метка — его собственная.
+    """
+    if MAC:
+        return
+    try:
+        runs = sorted(SENTINEL_DIR.glob("run_*"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    for path in runs[:-1] if keep_newest else runs:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def quit_obs():
-    """Сначала вежливо, чтобы OBS закрылся штатно; если не послушался — принудительно."""
+    """Закрыть свой OBS штатно, чтобы следующий запуск обошёлся без диалога безопасного режима.
+
+    Просим Lua-скрипт в OBS (quit.json): он останавливает виртуальную камеру — иначе OBS
+    спросит «Выйти?» — и закрывает главное окно, как пункт «Выход». taskkill без /F —
+    запасной путь, если скрипт не ответил: при открытом проекторе он закрывает только
+    проектор. /F — последнее средство; метку сбоя после него убираем сами.
+    """
+    import logging
     if MAC:
         subprocess.run(["osascript", "-e", 'tell application "OBS" to quit'], capture_output=True)
-    else:
-        subprocess.run(["taskkill", "/IM", "obs64.exe"], capture_output=True, creationflags=NO_WINDOW)
-    for _ in range(10):
-        if not obs_running():
-            return
-        time.sleep(0.5)
-    if MAC:
-        subprocess.run(["pkill", "-x", "OBS"], capture_output=True)
-    else:
-        subprocess.run(["taskkill", "/IM", "obs64.exe", "/F"], capture_output=True, creationflags=NO_WINDOW)
+        if not wait_obs_exit(5):
+            subprocess.run(["pkill", "-x", "OBS"], capture_output=True)
+        return
+    try:
+        seq = json.loads(QUIT_FILE.read_text(encoding="utf-8")).get("seq", 0) + 1
+    except (OSError, ValueError, AttributeError):
+        seq = 1
+    write_json_atomic(QUIT_FILE, {"seq": seq})
+    if not wait_obs_exit(20):
+        logging.warning("quit: OBS did not react to quit.json, taskkill")
+        target = ["/PID", str(_own_obs[0])] if _own_obs else ["/IM", "obs64.exe"]
+        subprocess.run(["taskkill", *target], capture_output=True, creationflags=NO_WINDOW)
+        if not wait_obs_exit(10):
+            logging.warning("quit: taskkill /F")
+            subprocess.run(["taskkill", *target, "/F"], capture_output=True, creationflags=NO_WINDOW)
+            wait_obs_exit(5)
+    if not obs_running():
+        clear_crash_sentinels()
 
 
 def set_autostart(enable):
@@ -720,6 +821,10 @@ def main():
 
     save_icon_file()
     ensure_active()
+    find_own_obs()
+    logging.info("tray started, own OBS pid %s", _own_obs and _own_obs[0])
+    # Метки от прошлых нештатных выходов: иначе диалог безопасного режима при следующем запуске
+    clear_crash_sentinels(keep_newest=True)
 
     bgmode_file = DATA / "bgmode.json"
 
@@ -912,6 +1017,7 @@ def main():
         write_json_atomic(f, {"seq": seq})
 
     updating = threading.Event()
+    quitting = threading.Event()  # выключаем OBS сами: watch_obs не должен нас опередить
 
     def update(icon, _item):
         if updating.is_set():
@@ -921,8 +1027,11 @@ def main():
         def work():
             try:
                 if check_for_update():
+                    if not MAC:
+                        quitting.set()
+                        quit_obs()  # штатно, а не taskkill установщика
                     run_update()
-                    # Установщик закроет OBS; запускает Shirma потом сам пользователь ярлыком
+                    # OBS уже закрыт; запускает Shirma потом сам пользователь ярлыком
                     # (OBS — потомок этого скрипта — антивирус оставил бы без камеры).
                     # Уходим сразу, чтобы pip мог заменить файлы окружения, которые мы держим.
                     on_main(icon.stop)
@@ -937,8 +1046,30 @@ def main():
         icon.update_menu()
 
     def shutdown(icon, _item):
-        quit_obs()
-        icon.stop()
+        if quitting.is_set():
+            return
+        quitting.set()
+        # Значок сейчас исчезнет, а скрытый OBS других следов не оставляет — подскажем,
+        # как вернуть Shirma. Уведомление видно, пока OBS закрывается (несколько секунд).
+        if icon.HAS_NOTIFICATION:
+            icon.notify(t("Запустить снова — ярлык «Shirma» на рабочем столе или в меню «Пуск».",
+                          "Start it again with the Shirma shortcut on the desktop or in the Start menu.")
+                        if not MAC else
+                        t("Запустить снова — приложение Shirma в ~/Applications (или Spotlight: Shirma).",
+                          "Start it again with the Shirma app in ~/Applications (or Spotlight: Shirma)."),
+                        t("Shirma выключается", "Shirma is quitting"))
+
+        def work():
+            started = time.monotonic()
+            try:
+                quit_obs()
+            except Exception:
+                logging.exception("quit")
+            finally:
+                # OBS закрывается за 2 с; уведомление уходит вместе со значком — дадим его прочитать
+                time.sleep(max(0.0, 4 - (time.monotonic() - started)))
+                on_main(icon.stop)
+        threading.Thread(target=work, daemon=True).start()
 
     menu = pystray.Menu(
         pystray.MenuItem(t("Показать превью", "Show preview"), show_preview, default=True),
@@ -995,10 +1126,13 @@ def main():
                 on_main(icon.update_menu)
 
     def watch_obs():
-        # OBS закрыли из его собственного трея — уходим вместе с ним
+        # OBS закрыли из его собственного трея (или он упал) — уходим вместе с ним
         time.sleep(20)
         while obs_running():
             time.sleep(3)
+        if quitting.is_set():
+            return  # выключаем сами — остановит shutdown
+        clear_crash_sentinels()  # упал — пусть следующий запуск обойдётся без безопасного режима
         on_main(icon.stop)
 
     threading.Thread(target=watch_folder, daemon=True).start()

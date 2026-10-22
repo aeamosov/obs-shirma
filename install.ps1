@@ -72,7 +72,18 @@ Write-Host (L "    Closing OBS for the update" '    \u0417\u0430\u043a\u0440\u04
 Read-Host (L "    OBS is running. Press Enter to close it and continue" '    OBS \u0437\u0430\u043f\u0443\u0449\u0435\u043d. \u041d\u0430\u0436\u043c\u0438\u0442\u0435 Enter, \u0447\u0442\u043e\u0431\u044b \u0437\u0430\u043a\u0440\u044b\u0442\u044c \u0435\u0433\u043e \u0438 \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c') | Out-Null }
     else { # OBS снова запущен - закрываю
 Write-Host (L "    OBS was started again - closing it" '    OBS \u0441\u043d\u043e\u0432\u0430 \u0437\u0430\u043f\u0443\u0449\u0435\u043d - \u0437\u0430\u043a\u0440\u044b\u0432\u0430\u044e') }
-    taskkill /IM obs64.exe 2>&1 | Out-Null
+    # Сначала просим сам OBS через Lua-скрипт Shirma (quit.json): он остановит виртуальную
+    # камеру и закроется штатно. taskkill без /F при работающей камере упирается в вопрос
+    # OBS "Выйти?", а /F оставляет метку сбоя - следующий запуск предложит безопасный режим.
+    $quit = Join-Path $Data "quit.json"
+    if (Test-Path (Join-Path $Data "shirma.lua")) {
+        $seq = 0
+        try { $seq = [int](Get-Content $quit -Raw -ErrorAction Stop | ConvertFrom-Json).seq } catch {}
+        Set-Content "$quit.tmp" ('{"seq": ' + ($seq + 1) + '}') -Encoding ASCII
+        Move-Item "$quit.tmp" $quit -Force
+        for ($i = 0; $i -lt 20 -and (Get-Process obs64 -ErrorAction SilentlyContinue); $i++) { Start-Sleep 1 }
+    }
+    if (Get-Process obs64 -ErrorAction SilentlyContinue) { taskkill /IM obs64.exe 2>&1 | Out-Null }
     for ($i = 0; $i -lt 10 -and (Get-Process obs64 -ErrorAction SilentlyContinue); $i++) { Start-Sleep 1 }
     if (Get-Process obs64 -ErrorAction SilentlyContinue) { taskkill /F /IM obs64.exe 2>&1 | Out-Null; Start-Sleep 1 }
 }
