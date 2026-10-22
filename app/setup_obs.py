@@ -936,10 +936,19 @@ def lua_profiles():
 
 
 def obs_running():
+    """Работает ли OBS, который помешает настройке: со сценой Shirma или любой без --multi
+    (такой при выходе перезапишет сцену своим состоянием). Копии с --multi и своей
+    сценой — например, OBS «Эха» — не в счёт: из-за них установка отказывалась работать."""
     if MAC:
         return subprocess.run(["pgrep", "-x", "OBS"], capture_output=True).returncode == 0
-    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq obs64.exe", "/NH"], capture_output=True).stdout
-    return b"obs64.exe" in out
+    ps = ("@(Get-CimInstance Win32_Process -Filter \"Name='obs64.exe'\" | Where-Object { "
+          "$_.CommandLine -notmatch '--multi' -or $_.CommandLine -match '--collection\\s+\"?Shirma\"?(\\s|$)' }).Count")
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+    if not out.isdigit():  # PowerShell не ответил — по-старому, по имени процесса
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq obs64.exe", "/NH"], capture_output=True).stdout
+        return b"obs64.exe" in out
+    return int(out) > 0
 
 
 def pick_camera(wanted, current_id=""):

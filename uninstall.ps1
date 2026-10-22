@@ -19,13 +19,26 @@ function L([string]$en, [string]$ru) { if ($RU) { [regex]::Unescape($ru) } else 
 $Data = Join-Path $env:LOCALAPPDATA "Shirma"
 $ObsCfg = Join-Path $env:APPDATA "obs-studio\basic"
 
+# OBS, который мешает установке: запущенный со сценой Shirma или любой без --multi (такой
+# держит общие настройки и при выходе может перезаписать сцену). Копии с --multi и своей
+# сценой - например, OBS "Эха" - не трогаем.
+function Get-ShirmaObs {
+    @(Get-CimInstance Win32_Process -Filter "Name='obs64.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -notmatch '--multi' -or $_.CommandLine -match '--collection\s+"?Shirma"?(\s|$)' })
+}
+function Stop-ShirmaObs([switch]$Force) {
+    foreach ($p in Get-ShirmaObs) {
+        if ($Force) { taskkill /F /PID $p.ProcessId 2>&1 | Out-Null } else { taskkill /PID $p.ProcessId 2>&1 | Out-Null }
+    }
+}
+
 # OBS может работать невидимым (Shirma убирает его значок), поэтому закрываем сами
-if (Get-Process obs64 -ErrorAction SilentlyContinue) {
+if (Get-ShirmaObs) {
     # OBS запущен. Нажмите Enter, чтобы закрыть его и продолжить
     Read-Host (L "OBS is running. Press Enter to close it and continue" 'OBS \u0437\u0430\u043f\u0443\u0449\u0435\u043d. \u041d\u0430\u0436\u043c\u0438\u0442\u0435 Enter, \u0447\u0442\u043e\u0431\u044b \u0437\u0430\u043a\u0440\u044b\u0442\u044c \u0435\u0433\u043e \u0438 \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c') | Out-Null
-    taskkill /IM obs64.exe 2>&1 | Out-Null
-    for ($i = 0; $i -lt 10 -and (Get-Process obs64 -ErrorAction SilentlyContinue); $i++) { Start-Sleep 1 }
-    if (Get-Process obs64 -ErrorAction SilentlyContinue) { taskkill /F /IM obs64.exe 2>&1 | Out-Null; Start-Sleep 1 }
+    Stop-ShirmaObs
+    for ($i = 0; $i -lt 10 -and (Get-ShirmaObs); $i++) { Start-Sleep 1 }
+    if (Get-ShirmaObs) { Stop-ShirmaObs -Force; Start-Sleep 1 }
 }
 # Значок в трее (pythonw из venv Shirma)
 Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |

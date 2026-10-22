@@ -62,10 +62,23 @@ function Find-Obs {
     return $null
 }
 
+# OBS, который мешает установке: запущенный со сценой Shirma или любой без --multi (такой
+# держит общие настройки и при выходе может перезаписать сцену). Копии с --multi и своей
+# сценой - например, OBS "Эха" - не трогаем.
+function Get-ShirmaObs {
+    @(Get-CimInstance Win32_Process -Filter "Name='obs64.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -notmatch '--multi' -or $_.CommandLine -match '--collection\s+"?Shirma"?(\s|$)' })
+}
+function Stop-ShirmaObs([switch]$Force) {
+    foreach ($p in Get-ShirmaObs) {
+        if ($Force) { taskkill /F /PID $p.ProcessId 2>&1 | Out-Null } else { taskkill /PID $p.ProcessId 2>&1 | Out-Null }
+    }
+}
+
 # OBS может работать невидимым (Shirma убирает его значок из трея), поэтому закрываем сами:
 # сначала штатно, а если не послушался (например, закрылось только окно превью) — принудительно.
 function Close-Obs([switch]$Ask) {
-    if (-not (Get-Process obs64 -ErrorAction SilentlyContinue)) { return }
+    if (-not (Get-ShirmaObs)) { return }
     if ($Ask -and $Update) { # Закрываю OBS для обновления
 Write-Host (L "    Closing OBS for the update" '    \u0417\u0430\u043a\u0440\u044b\u0432\u0430\u044e OBS \u0434\u043b\u044f \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f') }
     elseif ($Ask) { # OBS запущен. Нажмите Enter, чтобы закрыть его и продолжить
@@ -81,11 +94,11 @@ Write-Host (L "    OBS was started again - closing it" '    OBS \u0441\u043d\u04
         try { $seq = [int](Get-Content $quit -Raw -ErrorAction Stop | ConvertFrom-Json).seq } catch {}
         Set-Content "$quit.tmp" ('{"seq": ' + ($seq + 1) + '}') -Encoding ASCII
         Move-Item "$quit.tmp" $quit -Force
-        for ($i = 0; $i -lt 20 -and (Get-Process obs64 -ErrorAction SilentlyContinue); $i++) { Start-Sleep 1 }
+        for ($i = 0; $i -lt 20 -and (Get-ShirmaObs); $i++) { Start-Sleep 1 }
     }
-    if (Get-Process obs64 -ErrorAction SilentlyContinue) { taskkill /IM obs64.exe 2>&1 | Out-Null }
-    for ($i = 0; $i -lt 10 -and (Get-Process obs64 -ErrorAction SilentlyContinue); $i++) { Start-Sleep 1 }
-    if (Get-Process obs64 -ErrorAction SilentlyContinue) { taskkill /F /IM obs64.exe 2>&1 | Out-Null; Start-Sleep 1 }
+    Stop-ShirmaObs
+    for ($i = 0; $i -lt 10 -and (Get-ShirmaObs); $i++) { Start-Sleep 1 }
+    if (Get-ShirmaObs) { Stop-ShirmaObs -Force; Start-Sleep 1 }
 }
 
 # Распаковка zip через .NET, а не Expand-Archive: если PowerShell запущен не из
